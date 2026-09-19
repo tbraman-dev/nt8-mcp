@@ -18,7 +18,7 @@ by default. Not affiliated with NinjaTrader, LLC.
                  |  MCP
                  v
 +----------------------------------------------------------+
-|  nt8-mcp  (Python MCP server: 47 tools + the nt8 CLI)    |
+|  nt8-mcp  (Python MCP server: 50 tools + the nt8 CLI)    |
 +----------------------------------------------------------+
                  |  HTTP on localhost:7891
                  v
@@ -80,10 +80,10 @@ about the edit-compile-look-fix loop.
    file date. Backtests report the data they really used. A stale or half-loaded build says so.
 5. **It is safe to leave connected.** Most of what an assistant reads here is text from charts,
    logs and third-party add-ons — and text an assistant reads must never be able to move a funded
-   account. So version 1.2 has no order entry, and the one account-changing feature is off by
-   default, on disk, in every clone (see [Why there is no order entry (yet)](#why-there-is-no-order-entry-yet)
-   and the [Safety model](#safety-model)).
-6. **It is MCP-native.** 47 typed tools with docstrings written for a model, grouped by module. No
+   account. So no order can go to a live, funded or broker-demo account, and the two
+   account-changing features are off by default, on disk, in every clone (see
+   [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default) and the [Safety model](#safety-model)).
+6. **It is MCP-native.** 50 typed tools with docstrings written for a model, grouped by module. No
    bespoke IPC layer, no prompt glue.
 
 ## How it compares
@@ -94,7 +94,7 @@ you decide; they move fast.
 | | nt8-mcp | [eman007/cli-nt-bridge](https://github.com/eman007/cli-nt-bridge) | [ozmnf4/ninjatrader-mcp](https://github.com/ozmnf4/ninjatrader-mcp) | [anfs-pain/ninjatrader-mcp](https://github.com/anfs-pain/ninjatrader-mcp) | [Official NinjaTrader MCP](https://github.com/NT-NinjaTrader/mcp-skills) |
 |---|---|---|---|---|---|
 | Runs against | NT8 desktop (AddOn) | NT8 desktop (AddOn) | NT8 desktop (AddOn) or cloud | NT8 desktop (AddOn) | Tradovate cloud API |
-| Orders / positions / account | read only, plus opt-in disarmed flatten; Simulator-only order entry is planned ([why](#why-there-is-no-order-entry-yet)) | yes (no confirm/dry-run gate) | yes | yes | yes |
+| Orders / positions / account | read only by default; opt-in, disarmed flatten; opt-in, disarmed order entry on Simulator accounts only, with dry run + signed confirm ([why](#order-entry-simulator-only-off-by-default)) | yes (no confirm/dry-run gate) | yes | yes | yes |
 | Chart list, symbol, period | yes | no (headless only) | symbol + period | yes | no |
 | Indicator inputs + plot values (last n bars) | yes | no | current value only | current value only | no |
 | Drawing objects (tag, type, owner, anchors) | yes | no | no | no | no |
@@ -117,10 +117,11 @@ indicators and drawing objects, headless backtests that never need a Strategy An
 an ops module gated by dry-run + a signed, time-boxed confirm string instead of acting on the
 first call.
 
-## Why there is no order entry (yet)
+## Order entry: Simulator only, off by default
 
-Other NinjaTrader MCP servers can place trades, the official one included. This one cannot, in
-version 1.2. That is a decision about risk, not a missing feature, and here is the reasoning.
+Other NinjaTrader MCP servers can place trades on any account, the official one included. This one
+places orders on **Simulator and Playback accounts only**, and only after you switch that on by
+hand. That is a decision about risk, and here is the reasoning.
 
 **This tool feeds an assistant a lot of text that nobody vetted.** Indicator names, drawing tags,
 everything any script prints to the Output window, NinjaTrader's log, window titles, the output of
@@ -135,24 +136,30 @@ untrusted text. `nt8-mcp` runs *inside* your NinjaTrader desktop. It sees every 
 NinjaTrader sees — Sim, broker demo, funded, prop-firm evaluation — with no login of its own and
 no broker-side limit between a tool call and the order.
 
-**So the rule for 1.2 is: reading is free, acting is gated, and entering a trade is not offered.**
-The one account-changing feature, the ops module, can only *reduce* risk (cancel working orders,
-flatten a position), and even that is off until you create a file by hand, works on Simulator
-accounts only, shows a dry run first, and needs a signed confirm string within 30 seconds.
+**So the rule is: reading is free, acting is gated, and no order ever goes to a real account.**
+Order entry is useful for development, not just for trading: test how a strategy handles its
+orders, create a position for a test, reproduce a fill-handling bug. A Simulator account is enough
+for all of that. The order module (`nt_order_submit`, `nt_order_change`, `nt_order_cancel`) is its
+own file, and these are its gates:
 
-**What is planned.** Order entry on **Simulator accounts only**, as its own opt-in module, off by
-default. It is useful for development, not just for trading: test how a strategy handles its
-orders, create a position for a test, reproduce a fill-handling bug. It will use the gates the ops
-module already has:
+- an arming file, `orders.enabled`, that you create by hand; ignored again after 24 hours. The ops
+  module's file does not arm it, and its file does not arm the ops module;
+- Simulator and Playback accounts only, judged by the connection's provider and never by the
+  account's name. The Backtest account is refused too;
+- refused while any connection that can route orders to a real broker is up. A broker *demo*
+  counts as real, on purpose;
+- a dry run first, then a signed confirm string that works once, within 30 seconds, for exactly
+  the order the dry run showed;
+- hard caps: 2 contracts per order, 5 working orders per account, 6 orders per minute. A config
+  file can change them, up to fixed ceilings in the code (10 / 20 / 30);
+- it changes and cancels only the orders it placed itself;
+- every armed call, refused or not, is written to an audit log, before the order goes out.
 
-- an arming file you create by hand, ignored again after 24 hours;
-- Simulator accounts only, judged by the connection's provider and never by the account's name;
-- a dry run first, then a signed, time-boxed confirm string for the real call;
-- refused while any connection that can route orders to a real broker is up;
-- every call written to an audit log.
-
-There is no plan for a live-account switch in that module. If you need an assistant that trades a
-real account today, [`ozmnf4/ninjatrader-mcp`](https://github.com/ozmnf4/ninjatrader-mcp),
+**There is no live-account switch in that module, and there is no plan for one.** The ops module
+has a second file that widens it to other accounts, because a flatten can only reduce risk. An
+order can add risk, so the order module has no such file and no code path for one. If you need an
+assistant that trades a real account,
+[`ozmnf4/ninjatrader-mcp`](https://github.com/ozmnf4/ninjatrader-mcp),
 [`anfs-pain/ninjatrader-mcp`](https://github.com/anfs-pain/ninjatrader-mcp) and the
 [official server](https://github.com/NT-NinjaTrader/mcp-skills) do that. Think about what text that
 assistant can read in the same session before you connect it to funded money.
@@ -360,10 +367,45 @@ Local tools (no AddOn needed, but do touch the filesystem / NT8's own windows):
 target. `scripts/shot.ps1` (front-and-restore) is kept as a fallback for the rare window
 `PrintWindow` cannot read.
 
+## Order module (opt-in, Simulator only)
+
+**This is the only part of this repository that can open a position**, and it is disarmed by
+default, on disk, in every clone. Full contract: `docs/api/orders.md`. The reasoning:
+[Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default).
+
+**How to arm it.** Create an empty file named `orders.enabled` in
+`%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\`. No recompile, no NT8 restart. Every
+`/orders/*` endpoint answers `403 {"error":"orders module not armed"}` until that file exists and
+is younger than 24 h. Delete the file to disarm. `ops.enabled` does not arm this module.
+
+| Tool | Does |
+|---|---|
+| `nt_order_submit(account, instrument, action, order_type, quantity, limit_price=None, stop_price=None, tif=None, confirm=None, issued_at=None)` | One Market, Limit, StopMarket or StopLimit order on one Simulator or Playback account |
+| `nt_order_change(account, order_id, quantity=None, limit_price=None, stop_price=None, confirm=None, issued_at=None)` | Change the quantity or the prices of one working order that this module placed |
+| `nt_order_cancel(account, order_id, confirm=None, issued_at=None)` | Cancel one working order that this module placed |
+
+Each tool has two steps. Called with no `confirm`, it changes nothing and returns a plan plus a
+confirm string. Call it again with that exact string inside 30 seconds to act. The string works
+once. The result reports the state NinjaTrader shows after the call (`Working`, `Filled`,
+`Rejected`, ...), not the state you asked for: `ok` means "NinjaTrader took the call", never
+"filled".
+
+**Caps.** 2 contracts per order, 5 working orders per account, 6 orders per minute. The optional
+file `Documents\NinjaTrader 8\nt8mcp\orders.config.json` (`maxQuantity`, `maxWorkingOrders`,
+`maxSubmitsPerMinute`) changes them, up to the ceilings 10 / 20 / 30 in the code. A value outside
+`1..ceiling` falls back to the default, with a warning. A NinjaScript reload clears the per-minute
+count; the other two caps read live state.
+
+**What it does not do, armed or not:** touch an account whose provider is not Simulator or
+Playback, touch the Backtest account, place brackets, ATM strategies or OCO orders, act on all
+accounts, or change an order it did not place. Every armed call is appended to
+`Documents\NinjaTrader 8\nt8mcp\orders.jsonl`. To end flat after a test, use the ops module's
+`nt_flatten`.
+
 ## Ops module (opt-in)
 
-**This is the only part of this repository that can change a trading account**, and it is
-disarmed by default, on disk, in every clone. Full contract: `docs/api/ops.md`.
+This module can only **reduce** risk on a trading account, and it is disarmed by default, on
+disk, in every clone. Full contract: `docs/api/ops.md`.
 
 **How to arm it.** Create an empty file named `ops.enabled` in
 `%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\`. No recompile, no NT8 restart. Every
@@ -389,8 +431,8 @@ file to disarm again, at any time, with no side effect.
 
 **What it does not do, armed or not:** open a position, submit or modify an order, enable or
 disable a strategy, or switch a live chart's series. It can only reduce exposure. (Simulator-only
-order entry is planned as a separate opt-in module; see
-[Why there is no order entry (yet)](#why-there-is-no-order-entry-yet).) `Account.FlattenEverything()` is never
+order entry is a separate opt-in module with its own arming file; see
+[Order module](#order-module-opt-in-simulator-only).) `Account.FlattenEverything()` is never
 called — every action names one account. A non-Simulator account is never even listed as a
 target unless a second file, `ops.live`, is present (this repository never creates it). Only the
 two POSTs, `/ops/flatten` and `/ops/reconnect` (and `nt_flatten`), are refused outright while any
@@ -412,9 +454,10 @@ between dry-run and confirm) are covered by the automated test suite instead of 
 
 ## Safety model
 
-- **Read-only by default.** Version 1.2 has no order entry, no order modify and no strategy
-  enable or disable. The reasoning, and the plan for Simulator-only order entry, are in
-  [Why there is no order entry (yet)](#why-there-is-no-order-entry-yet). Outside the two opt-in
+- **Read-only by default.** With no arming file on disk there is no order entry, no order
+  modify and no flatten, and there is never a strategy enable or disable. Order entry exists for
+  Simulator and Playback accounts only; the reasoning is in
+  [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default). Outside the opt-in
   features below, the only writes are a chart reload, a screenshot file and a compile.
 - **Backtests use the Backtest account only.** A request that names another account is refused.
 - **Local only.** The AddOn listens on `localhost:7891`. Nothing is sent to any server by this
@@ -462,7 +505,7 @@ tool or bad arguments.
 | Path | What |
 |---|---|
 | `addon/NT8Bridge.cs` | the AddOn core: HTTP listener, JSON, thread-safe UI access, module discovery |
-| `addon/NT8Bridge.*.cs`, `addon/NT8BridgeOps.cs` | one module per file; the core finds each `Route_<Module>` by reflection, so a new module is a new file and no edit to the core |
+| `addon/NT8Bridge.*.cs`, `addon/NT8BridgeOps.cs`, `addon/NT8BridgeOrders.cs` | one module per file; the core finds each `Route_<Module>` by reflection, so a new module is a new file and no edit to the core |
 | `addon/NOTES.md`, `addon/BACKTEST_RECIPE.md` | what we learned about NinjaTrader internals: reflection targets, threading rules, the headless backtest recipe |
 | `server/nt8_mcp/` | the MCP server; `tools_*.py` files are loaded automatically |
 | `API.md`, `docs/api/` | the HTTP contract, one file per module |

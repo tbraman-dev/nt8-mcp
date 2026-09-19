@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.0 — 2026-09-19
+
+### Added
+
+- **Order entry on Simulator and Playback accounts only**, as its own opt-in module
+  (`addon/NT8BridgeOrders.cs`), disarmed by default: `GET /orders/status`, `POST /orders/submit`,
+  `POST /orders/change`, `POST /orders/cancel`, and the tools `nt_order_submit`, `nt_order_change`,
+  `nt_order_cancel`. Market, Limit, StopMarket and StopLimit; one account, one instrument, one
+  order per call. Full contract: `docs/api/orders.md`.
+- Its gates: the arming file `orders.enabled` (24 h, separate from `ops.enabled` in both
+  directions); accounts judged by provider, never by name, with the Backtest account refused;
+  refused while any order-routing connection to a real broker is up; dry run, then a signed,
+  single-use, 30-second confirm over the exact plan; caps of 2 contracts per order, 5 working
+  orders per account and 6 orders per minute, adjustable through `nt8mcp\orders.config.json` up to
+  the code ceilings 10 / 20 / 30; change and cancel only for orders the module placed; an audit
+  line for every armed call in `nt8mcp\orders.jsonl`, written before a confirmed action runs.
+- **There is no live-account switch** in the order module: it never reads `ops.live`.
+- `scripts/smoke.d/91-orders.sh`: disarmed-state checks only; it never arms and never submits.
+
+### Changed
+
+- README: "Why there is no order entry (yet)" is now "Order entry: Simulator only, off by
+  default". 50 tools (47 + 3).
+
+### Known limitations
+
+- A NinjaScript reload clears the orders-per-minute count. The other two caps read live state.
+- No brackets, ATM strategies or OCO orders.
+
 ## 1.2.0 — 2026-09-19
 
 Merge of read-only and dev-loop capability from

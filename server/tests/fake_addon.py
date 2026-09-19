@@ -70,6 +70,17 @@ class FakeAddon:
         """Answer `path` with a constant body."""
         return self.register(path, method, lambda req: (status, body))
 
+    def orders(self, handler):
+        """Register all four /orders/* routes on ONE handler: GET /orders/status and POST
+        /orders/{submit,change,cancel}. `req.path` tells the handler which verb it is, so a single
+        spec object can enforce the gate chain for every one of them — which is the point: the
+        arming gate and the confirm gate are shared, and a fake that split them per route could
+        pass while the real module enforced them in only one place."""
+        self.register("/orders/status", "GET", handler)
+        for verb in ("submit", "change", "cancel"):
+            self.register("/orders/" + verb, "POST", handler)
+        return self
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self):

@@ -2,9 +2,12 @@
 
 The AddOn (`addon/NT8Bridge*.cs`) runs inside NinjaTrader 8 and listens on
 `http://localhost:7891/`. **It is read-only by default.** No order or account-changing
-endpoint exists unless you opt in: an opt-in, disarmed-by-default ops module exists
+endpoint exists unless you opt in. Two opt-in, disarmed-by-default modules exist: ops
 (flatten, a naked-position watchdog, reconnect and a restart CLI) — see
-[Ops (opt-in, disarmed by default)](#ops-opt-in-disarmed-by-default-batch-3) below. Outside
+[Ops (opt-in, disarmed by default)](#ops-opt-in-disarmed-by-default-batch-3) — and order entry
+on Simulator and Playback accounts only — see
+[Orders (opt-in, disarmed by default, Simulator only)](#orders-opt-in-disarmed-by-default-simulator-only).
+Each has its own arming file; neither file arms the other module. Outside
 that module, writes are limited to `reload`, `screenshot`, `compile`/`compile?reload=1`, and
 the opt-in, flag-gated `data/download`.
 
@@ -73,7 +76,7 @@ accepts `first` (the first chart found).
 ### `GET /health`
 
 ```json
-{ "ok": true, "addonVersion": "1.2.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
+{ "ok": true, "addonVersion": "1.3.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
   "connections": [{"name":"Sim101 feed","status":"Connected","provider":"Simulator","canManageOrders":false}],
   "charts": 1, "anyLive": false, "anyNonSim": true, "standingModal": null,
   "pid": 12345, "processStartUtc": "2026-09-18T08:59:50Z",
@@ -742,9 +745,10 @@ matplotlib is optional — without it `pdf` is `null` and `note` says why; never
 
 ## Ops (opt-in, disarmed by default, Batch 3)
 
-**This is the only part of this repository that can change a trading account.** Everything it
-can do is reduce-only: cancel working orders, flatten open positions, reconnect a connection
-NinjaTrader itself dropped. There is no order entry, no strategy enable/disable, no chart-series
+**This module can only reduce risk.** Everything it can do is reduce-only: cancel working
+orders, flatten open positions, reconnect a connection NinjaTrader itself dropped. There is no
+order entry in this module (that is the separate [Orders](#orders-opt-in-disarmed-by-default-simulator-only)
+module), no strategy enable/disable, no chart-series
 switch, no all-accounts form, and `Account.FlattenEverything()` is never called anywhere in this
 codebase. The module never creates `ops.enabled` and never creates `ops.live`.
 
@@ -869,6 +873,43 @@ path, which would 403.
   working order (readable or not), or if the process list itself could not be read.
 
 ---
+
+## Orders (opt-in, disarmed by default, Simulator only)
+
+**This is the only part of this repository that can open a position.** The full contract — every
+field, status code, refusal, the audit format and a manual test — is `docs/api/orders.md`. This
+section is the summary.
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/orders/status` | armed?, flag age, the caps in force, the Simulator / Playback accounts that are valid targets |
+| POST | `/orders/submit` | dry-run `{plan, confirm, issuedAt}`, or the result of a confirmed submit |
+| POST | `/orders/change` | the same two steps for the quantity and/or prices of one working order |
+| POST | `/orders/cancel` | the same two steps for one working order |
+
+**MCP: exactly three tools**, `nt_order_submit`, `nt_order_change`, `nt_order_cancel`. Order types
+Market, Limit, StopMarket, StopLimit; TIF Day or Gtc; one account, one instrument, one order per
+call. No brackets, ATM strategies, OCO or all-accounts form.
+
+**The gate chain, in this order.** (1) The arming file `orders.enabled` beside the AddOn,
+stat-checked on every request, ignored when older than 24 h or future-dated; unarmed = `403
+{"error":"orders module not armed"}` on all four paths, before the body is parsed. `ops.enabled`
+does not arm this module. (2) The three POSTs are refused while `AnyLiveConnected()` is true; there
+is no `force`. (3) The account must resolve to exactly one account whose provider is
+`Provider.Simulator` or `Provider.Playback`; a provider that cannot be read is a refusal; the
+Backtest account is refused by name. **There is no live switch: the module never reads `ops.live`
+and has no code path that accepts another provider.** (4) Validation. (5) Caps: 2 contracts per
+order, 5 working orders per account, 6 confirmed submits per minute; the optional file
+`nt8mcp\orders.config.json` changes them up to the code ceilings 10 / 20 / 30, and a value outside
+`1..ceiling` falls back to the default with a warning. (6) No `confirm` = dry run. (7) The confirm
+is an HMAC over `orders.<verb>|` + the plan (caps included) + the AddOn-stamped `issuedAt`, valid
+for 30 s, compared in fixed time, and **single-use**. (8) The call runs outside every collection
+lock; the result reports the order's true state after a bounded re-read, and `ok` never means
+"filled". (9) Every armed call is audited to `nt8mcp\orders.jsonl`; a confirmed action writes an
+intent line first and does not run if that write fails.
+
+`change` and `cancel` act only on orders this module placed (after a NinjaScript reload it adopts
+its own working orders again, by order name, on Simulator / Playback accounts only).
 
 ## Threading rules (for the AddOn author)
 

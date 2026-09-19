@@ -5,7 +5,8 @@ guardian and the restart CLI. Same conventions as `API.md`: JSON, UTF-8,
 `{"error":"…"}` on 4xx/5xx, times local NT8 `yyyy-MM-ddTHH:mm:ss` except `issuedAt` and the audit
 log's `ts`, which are UTC.
 
-**This is the only part of this repository that can change a trading account**, and everything it
+**This module can only reduce risk on a trading account** (order entry is the separate,
+Simulator-only module in `docs/api/orders.md`), and everything it
 can do is reduce-only: cancel working orders, flatten open positions, reconnect a connection
 NinjaTrader itself dropped. There is no order entry, no strategy enable/disable, no chart-series
 switch, no all-accounts form, and `Account.FlattenEverything()` is never called. The module never
