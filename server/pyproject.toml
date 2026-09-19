@@ -1,0 +1,22 @@
+[project]
+name = "nt8-mcp"
+version = "1.2.0"
+description = "MCP server bridging Claude to a live NinjaTrader 8 instance via the NT8Bridge AddOn"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["mcp"]
+
+[project.optional-dependencies]
+parquet = ["numpy", "pyarrow"]   # nt_nrd_export
+report = ["matplotlib>=3.5"]     # nt_report PDF
+
+[project.scripts]
+nt8-mcp = "nt8_mcp.server:main"
+nt8 = "nt8_mcp.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["nt8_mcp*"]

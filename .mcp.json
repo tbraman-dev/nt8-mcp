@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "nt8": {
+      "command": "nt8-mcp"
+    }
+  }
+}
