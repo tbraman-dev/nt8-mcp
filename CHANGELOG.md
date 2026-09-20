@@ -1,5 +1,93 @@
 # Changelog
 
+## 1.4.0 — 2026-09-20
+
+### Added
+
+- **Order module: brackets, close, reverse, and manage-any-order.** `nt_order_bracket` sends an
+  entry plus a stop and any number of targets under one plan and one confirm; exits are sized to
+  the entry's real fill, not the requested quantity. `nt_position_close` and `nt_position_reverse`
+  cancel one instrument's working orders on one account, then flatten it (`reverse` also enters
+  the same quantity the other way). `nt_order_change` and `nt_order_cancel` now reach **any**
+  working order on a Simulator/Playback account — a running strategy's stop, an ATM's target, a
+  hand-placed order — and the plan names its owner (`module` / `strategy <name>` / `atm` /
+  `manual`). **One OCO pair per target**, because NinjaTrader cancels every other live order in an
+  OCO group when one fills or is cancelled: cancelling a target also cancels its own paired stop,
+  never a sibling pair's. Caps raised to 10 contracts per order / 20 working orders per account /
+  60 submits per minute, with config-file ceilings of 100 / 100 / 600. Full contract:
+  `docs/api/orders.md`.
+- **ATM strategies on Sim (opt-in, Simulator only)**: `nt_atm_templates`, `nt_atm_status`,
+  `nt_atm_start`, `nt_atm_close`, `nt_atm_change` — one entry order under a saved ATM template,
+  with NinjaTrader arming and managing that template's stop and target. Same gate chain as the
+  order module. Full contract: `docs/api/atm.md`.
+- **Strategies on Sim (opt-in)**: `nt_strategy_start` adds a strategy to NinjaTrader's own Control
+  Center Strategies grid, enabled, on a Simulator/Playback account, so the user sees the row and
+  can disable it by hand; `nt_strategy_stop` disables it and reports the position and working
+  orders left behind (it does not flatten); `nt_strategy_runs` reads state, position, working
+  orders and realized P&L for what this server started. Full contract: `docs/api/strategyrun.md`.
+- **Playback control and the replay bench (opt-in)**: `nt_playback_seek`, `nt_playback_speed` and
+  `nt_playback_run` (a bounded run job: from/to/speed, always pauses at the end) drive the Market
+  Replay clock, gated by the same `orders.enabled` file, a Connected Playback connection, no
+  exposure on any non-Playback account, and no modal dialog. Proven: 3 replay hours in 55 s at
+  200x with a strategy running on Playback101, 19 fills collected. Full contract:
+  `docs/api/playback.md`.
+- **`nt_reconcile`**: pairs a backtest's trades with a Market Replay run's real fills and reports
+  matched pairs (with price/time deltas), fills only on one side, and a plain verdict. A backtest
+  stamps a trade at the bar's close time and a replay fill at the real time, so up to one bar of
+  time difference is normal (`tolerance_seconds`); a large price difference points at the
+  historical and replay stores holding different data for that day, not a fill-model bug. Full
+  contract: `docs/api/reconcile.md`.
+- **Chart control**: `nt_chart_indicator_add` / `nt_chart_indicator_remove` add or remove an
+  indicator on a chart (remove of one this module did not add needs `force`); `nt_chart_set_series`
+  changes a chart's instrument and/or bar period (refused with an enabled strategy attached);
+  `nt_chart_scroll_to` moves the visible window to a time; `nt_trade_shot` scrolls to a trade's
+  entry and screenshots it. None of these touch an account or need an arming file. Full contract:
+  `docs/api/chartcontrol.md`.
+
+### Changed
+
+- 79 tools (57 + 22).
+- README/API.md: the order module's summary no longer says "it changes and cancels only the
+  orders it placed itself" — it can now manage any working order on a Simulator/Playback account,
+  and the caps/ceilings numbers are updated to 10/20/60 and 100/100/600.
+- `docs/api/playback.md` "Status": seek, speed and the run driver are exercised on NinjaTrader
+  8.1.8.2 (see Added, above).
+- `docs/api/chartcontrol.md` "Status": indicator add/remove and scroll are exercised on NinjaTrader
+  8.1.8.2. A series change can be undone exactly with `restore`.
+
+### Fixed
+
+- **A single-series backtest with High fill resolution ended as `error` in 1.3.1** although the run
+  had happened: the check after the run counted the fill series NinjaTrader adds for High as a
+  second data series. Multi-series + High is now refused BEFORE the run, on a throwaway instance
+  that counts only the series the strategy itself adds, so NinjaTrader never shows its dialog;
+  single-series + High runs.
+- Every dry run on a Playback account says when the replay is paused (`replayWarning`): nothing
+  fills there until the replay clock moves.
+
+- **Rollover warning on backtests.** A backtest of a dated futures contract whose window starts
+  before that contract became the front month now carries a `rollover:` warning with the date.
+  Observed with a broker data feed: the minute history stored for the December contract on a day
+  before the rollover held the same prices as the September contract's, a calendar spread away
+  from the December prices a Market Replay recording of that day held.
+- The "connect a data provider" warning compared times and not dates, so it fired on every full
+  day (a session ends before midnight). It now fires only when whole days are missing.
+
+### Known limitations
+
+- An order that was created but never sent (for example after a failed ATM start on a build
+  before this one) stays in NinjaTrader's account as `Initialized` / `CancelPending` until
+  NinjaTrader restarts. The exposure guards count it as a working order on purpose; restart
+  NinjaTrader to clear it.
+- `nt_chart_set_series(restore=True)` forgets the original series after a NinjaScript reload.
+- A resting bracket's exits do not survive a NinjaScript reload: the bracket watcher is a static
+  that a hot reload discards, so a resting entry submitted before a reload gets no exits.
+- A part-filled resting entry is protected only once it reaches a terminal state (`Filled`,
+  `Cancelled` or `Rejected`); one that part-fills and keeps resting is not protected until then.
+- Strategies started by `nt_strategy_start` are not re-adopted by id after a NinjaScript reload:
+  they keep running and keep their Control Center grid row, but `nt_strategy_stop` can no longer
+  reach them by the id this server returned — disable them by hand in the grid instead.
+
 ## 1.3.1 — 2026-09-19
 
 ### Fixed

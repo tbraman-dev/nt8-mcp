@@ -18,7 +18,7 @@ by default. Not affiliated with NinjaTrader, LLC.
                  |  MCP
                  v
 +----------------------------------------------------------+
-|  nt8-mcp  (Python MCP server: 57 tools + the nt8 CLI)    |
+|  nt8-mcp  (Python MCP server: 79 tools + the nt8 CLI)    |
 +----------------------------------------------------------+
                  |  HTTP on localhost:7891
                  v
@@ -59,6 +59,12 @@ by default. Not affiliated with NinjaTrader, LLC.
   `.nrd` replay files into Parquet.
 - **Real fills and performance.** Executions and round-trip performance for any account, with
   correct pairing across positions held for days.
+- **A simulation bench.** Write a strategy, compile it, backtest it headlessly, then run it for
+  real on a Simulator account or drive a Market Replay session through it, and check the replay's
+  real fills against the backtest's with `nt_reconcile`. All opt-in, all off by default — see
+  [Order module](#order-module-opt-in-simulator-only),
+  [Strategies on Sim](#strategies-on-sim-opt-in) and
+  [Playback control and the replay bench](#playback-control-and-the-replay-bench-opt-in).
 - **A truth check on the tool itself.** `nt_health`, `nt_status` and `nt_compat` tell the assistant
   which build is running, if it is older than your source, and which NinjaTrader internals an
   upgrade broke — so it does not debug code that is not the code that is running.
@@ -83,8 +89,13 @@ about the edit-compile-look-fix loop.
    account. So no order can go to a live, funded or broker-demo account, and the two
    account-changing features are off by default, on disk, in every clone (see
    [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default) and the [Safety model](#safety-model)).
-6. **It is MCP-native.** 57 typed tools with docstrings written for a model, grouped by module. No
+6. **It is MCP-native.** 79 typed tools with docstrings written for a model, grouped by module. No
    bespoke IPC layer, no prompt glue.
+7. **It closes the loop with a simulation bench.** Write a strategy, compile it, backtest it
+   headlessly, then run it for real on a Simulator account or in a Market Replay session and
+   compare the fills against the backtest — build, compile, backtest, run on Sim or in a replay,
+   compare (see [Strategies on Sim](#strategies-on-sim-opt-in) and
+   [Playback control and the replay bench](#playback-control-and-the-replay-bench-opt-in)).
 
 ## How it compares
 
@@ -94,7 +105,7 @@ you decide; they move fast.
 | | nt8-mcp | [eman007/cli-nt-bridge](https://github.com/eman007/cli-nt-bridge) | [ozmnf4/ninjatrader-mcp](https://github.com/ozmnf4/ninjatrader-mcp) | [anfs-pain/ninjatrader-mcp](https://github.com/anfs-pain/ninjatrader-mcp) | [Official NinjaTrader MCP](https://github.com/NT-NinjaTrader/mcp-skills) |
 |---|---|---|---|---|---|
 | Runs against | NT8 desktop (AddOn) | NT8 desktop (AddOn) | NT8 desktop (AddOn) or cloud | NT8 desktop (AddOn) | Tradovate cloud API |
-| Orders / positions / account | read only by default; opt-in, disarmed flatten; opt-in, disarmed order entry on Simulator accounts only, with dry run + signed confirm ([why](#order-entry-simulator-only-off-by-default)) | yes (no confirm/dry-run gate) | yes | yes | yes |
+| Orders / positions / account | read only by default; opt-in, disarmed flatten; opt-in, disarmed order entry (submit, bracket, change, cancel, close, reverse), ATM strategies and strategies-on-Sim on Simulator/Playback accounts only, with dry run + signed confirm ([why](#order-entry-simulator-only-off-by-default)) | yes (no confirm/dry-run gate) | yes | yes | yes |
 | Chart list, symbol, period | yes | no (headless only) | symbol + period | yes | no |
 | Indicator inputs + plot values (last n bars) | yes | no | current value only | current value only | no |
 | Drawing objects (tag, type, owner, anchors) | yes | no | no | no | no |
@@ -106,16 +117,18 @@ you decide; they move fast.
 | NT8 trace/log tail | yes | no | no | no | no |
 | Headless backtest (summary + trade list, Tick Replay, custom bar types) | yes (`nt_backtest`) | yes | no | no | no |
 | Grid optimize / walk-forward | yes, a Python loop over `/backtest` (`nt_optimize`, `nt_walkforward`) | yes, through the Strategy Analyzer window itself | no | no | no |
-| End-to-end Market Replay playback runs (connect, seek, speed, drive a session start to finish) | no — read-only transport state only (`nt_playback`) | yes | no | no | no |
+| End-to-end Market Replay playback runs (connect, seek, speed, drive a session start to finish) | read-only transport state (`nt_playback`) plus opt-in seek / speed / a bounded run driver (`nt_playback_seek`, `nt_playback_speed`, `nt_playback_run`) — never connects or disconnects | yes | no | no | no |
 | Naked-position watchdog / auto-reconnect / restart CLI | yes, opt-in, disarmed by default, dry-run + signed confirm on the one order-touching call | yes (no confirm/dry-run gate) | no | no | no |
 
 What cli-nt-bridge has that this repo deliberately still does not: a real Optimize/WalkForward run
 driven through the Strategy Analyzer window (`/analyze` — not included, see "Known limitations" in
-`CHANGELOG.md`), and end-to-end playback control (connect/seek/speed). What this repo
-has that cli-nt-bridge does not: MCP-native tools (no bespoke CLI/IPC layer), eyes on chart
-indicators and drawing objects, headless backtests that never need a Strategy Analyzer window, and
-an ops module gated by dry-run + a signed, time-boxed confirm string instead of acting on the
-first call.
+`CHANGELOG.md`), and a Playback **connect**/disconnect control (seek, speed and a bounded run
+driver are opt-in here; connecting the transport stays a manual step, see
+[Playback control and the replay bench](#playback-control-and-the-replay-bench-opt-in)). What this
+repo has that cli-nt-bridge does not: MCP-native tools (no bespoke CLI/IPC layer), eyes on chart
+indicators and drawing objects, headless backtests that never need a Strategy Analyzer window, an
+ops module gated by dry-run + a signed, time-boxed confirm string instead of acting on the first
+call, and a backtest-versus-replay reconciliation check (`nt_reconcile`).
 
 ## Order entry: Simulator only, off by default
 
@@ -139,20 +152,24 @@ no broker-side limit between a tool call and the order.
 **So the rule is: reading is free, acting is gated, and no order ever goes to a real account.**
 Order entry is useful for development, not just for trading: test how a strategy handles its
 orders, create a position for a test, reproduce a fill-handling bug. A Simulator account is enough
-for all of that. The order module (`nt_order_submit`, `nt_order_change`, `nt_order_cancel`) is its
-own file, and these are its gates:
+for all of that. The order module (`nt_order_submit`, `nt_order_bracket`, `nt_order_change`,
+`nt_order_cancel`, `nt_position_close`, `nt_position_reverse`) is its own file, and these are its
+gates:
 
 - an arming file, `orders.enabled`, that you create by hand; ignored again after 24 hours. The ops
-  module's file does not arm it, and its file does not arm the ops module;
+  module's file does not arm it, and its file does not arm the ops module — the same file also
+  arms ATM strategies, strategies-on-Sim and the Playback controls below;
 - Simulator and Playback accounts only, judged by the connection's provider and never by the
   account's name. The Backtest account is refused too;
 - refused while any connection that can route orders to a real broker is up. A broker *demo*
   counts as real, on purpose;
 - a dry run first, then a signed confirm string that works once, within 30 seconds, for exactly
   the order the dry run showed;
-- hard caps: 2 contracts per order, 5 working orders per account, 6 orders per minute. A config
-  file can change them, up to fixed ceilings in the code (10 / 20 / 30);
-- it changes and cancels only the orders it placed itself;
+- hard caps: 10 contracts per order, 20 working orders per account, 60 orders per minute. A config
+  file can change them, up to fixed ceilings in the code (100 / 100 / 600);
+- it can change or cancel **any** working order on the gated account, not only the ones it placed
+  itself — the plan names the order's owner before you confirm, so you see what you are about to
+  take away;
 - every armed call, refused or not, is written to an audit log, before the order goes out.
 
 **There is no live-account switch in that module, and there is no plan for one.** The ops module
@@ -254,6 +271,21 @@ AddOn passthroughs (need NT8 open with the AddOn compiled in), grouped by the mo
 | `nt_screenshot(chart="first")` | PNG of the chart window |
 | `nt_status()` | Is the running assembly newer than the newest `.cs` on disk (`GET /ntstatus`), plus an out-of-band check from Python: the newest `.cs` date on disk against the build time, and the installed AddOn files against the repo's. It reports a `disagreement` when the AddOn says it is fresh and the disk says it is not, so a stale AddOn cannot vouch for itself |
 | `nt_compat()` | The reflection-resolution table for every NT8 member this repo binds by name (`GET /compat`) — what an NT8 upgrade broke |
+
+### Chart control
+
+| Tool | Returns |
+|---|---|
+| `nt_chart_indicator_add(indicator, chart="first", inputs=None, panel=None)` | Add an indicator to a chart; returns the chart report (instrument, period, visible range, indicators read back off the chart) |
+| `nt_chart_indicator_remove(chart="first", indicator=None, index=None, force=False)` | Remove an indicator by name or index; only one this tool added, unless `force=True` |
+| `nt_chart_set_series(chart="first", instrument=None, bars_period=None)` | Change a chart's instrument and/or bar period; refused with an enabled strategy attached |
+| `nt_chart_scroll_to(time, chart="first")` | Scroll a chart's visible window to a time, keeping its width |
+| `nt_trade_shot(run_id, trade_index, chart="first")` | Scroll to one trade's entry time, then screenshot it |
+
+None of these touch an account or need an arming file. `nt_chart_indicator_add` and
+`nt_chart_indicator_remove` are proven on a live NinjaTrader 8.1.8.2 install; so is
+`nt_chart_scroll_to`. `nt_chart_set_series(restore=True)` puts back exactly what the chart showed before. Full contract:
+`docs/api/chartcontrol.md`.
 
 ### Compile / reload
 
@@ -377,15 +409,17 @@ far back the provider goes.
 | `nt_strategies_running(materialize=False)` | The Control Center's Strategies grid — a strategy population no chart walk can see. `materialize=True` forces the tab into view and restores the user's tab afterwards |
 | `nt_window_shot(window="", chart="", hwnd=0, path="")` | PNG of any NT8 window, captured in-process with `PrintWindow` — never fronts or restores it |
 
-### Playback (read-only)
+### Playback
 
 | Tool | Returns |
 |---|---|
 | `nt_playback(instrument="", coverage=False, budget_s=20)` | Is the Market Replay transport connected, loaded, parked or running; optional bounded coverage scan of the replay store |
 
-There is no seek or speed control here, and there will not be one: writing NinjaTrader's replay
-speed property **is** the play button — a deliberate design decision (see "Known limitations" in
-`CHANGELOG.md`).
+The read side above never connects, disconnects, seeks or changes the replay speed. Seek, speed
+and a bounded run driver exist too, opt-in behind the order module's arming file — see
+[Playback control and the replay bench](#playback-control-and-the-replay-bench-opt-in). The
+Playback connection itself is still a manual step: none of these tools ever connect or disconnect
+it.
 
 Local tools (no AddOn needed, but do touch the filesystem / NT8's own windows):
 
@@ -415,8 +449,11 @@ is younger than 24 h. Delete the file to disarm. `ops.enabled` does not arm this
 | Tool | Does |
 |---|---|
 | `nt_order_submit(account, instrument, action, order_type, quantity, limit_price=None, stop_price=None, tif=None, confirm=None, issued_at=None)` | One Market, Limit, StopMarket or StopLimit order on one Simulator or Playback account |
-| `nt_order_change(account, order_id, quantity=None, limit_price=None, stop_price=None, confirm=None, issued_at=None)` | Change the quantity or the prices of one working order that this module placed |
-| `nt_order_cancel(account, order_id, confirm=None, issued_at=None)` | Cancel one working order that this module placed |
+| `nt_order_bracket(account, instrument, action, order_type, quantity, limit_price=None, stop_price=None, stop_loss_price=None, stop_loss_ticks=None, targets=None, tif=None, confirm=None, issued_at=None)` | One entry with its stop loss and profit target(s), under one plan and one confirm |
+| `nt_order_change(account, order_id, quantity=None, limit_price=None, stop_price=None, confirm=None, issued_at=None)` | Change the quantity or the prices of ANY working order on the account, whoever placed it |
+| `nt_order_cancel(account, order_id, confirm=None, issued_at=None)` | Cancel ANY working order on the account, whoever placed it |
+| `nt_position_close(account, instrument, confirm=None, issued_at=None)` | Cancel one instrument's working orders on one account, then flatten it |
+| `nt_position_reverse(account, instrument, confirm=None, issued_at=None)` | The same, then enter the same quantity on the other side |
 
 Each tool has two steps. Called with no `confirm`, it changes nothing and returns a plan plus a
 confirm string. Call it again with that exact string inside 30 seconds to act. The string works
@@ -424,17 +461,92 @@ once. The result reports the state NinjaTrader shows after the call (`Working`, 
 `Rejected`, ...), not the state you asked for: `ok` means "NinjaTrader took the call", never
 "filled".
 
-**Caps.** 2 contracts per order, 5 working orders per account, 6 orders per minute. The optional
-file `Documents\NinjaTrader 8\nt8mcp\orders.config.json` (`maxQuantity`, `maxWorkingOrders`,
-`maxSubmitsPerMinute`) changes them, up to the ceilings 10 / 20 / 30 in the code. A value outside
-`1..ceiling` falls back to the default, with a warning. A NinjaScript reload clears the per-minute
-count; the other two caps read live state.
+**Brackets and the OCO pair rule.** `nt_order_bracket` sizes the stop and each target to what the
+entry really **filled**, not to what was asked for, with tick offsets measured from the real
+average fill price. A resting entry comes back with no exits yet (`exitsPending:true`); a bounded
+watcher submits them once it fills. NinjaTrader cancels every other **live** order in an OCO group
+the moment one member fills or is cancelled, so each target gets its **own** stop under its own
+OCO pair — one pair per target, not one shared group — and cancelling a target only ever takes its
+own paired stop with it, never a sibling pair's. To move a target's price without breaking that
+pairing, use `nt_order_change` instead of cancelling and resubmitting.
+
+**Caps.** 10 contracts per order, 20 working orders per account, 60 confirmed submits per minute.
+The optional file `Documents\NinjaTrader 8\nt8mcp\orders.config.json` (`maxQuantity`,
+`maxWorkingOrders`, `maxSubmitsPerMinute`) changes them, up to the ceilings 100 / 100 / 600 in the
+code. A value outside `1..ceiling` falls back to the default, with a warning. A bracket's exits and
+an ATM's exits are exempt from the working-order cap (the account's hard ceiling of 100 live
+orders in code still applies); a NinjaScript reload clears the per-minute count, the other two caps
+read live state.
 
 **What it does not do, armed or not:** touch an account whose provider is not Simulator or
-Playback, touch the Backtest account, place brackets, ATM strategies or OCO orders, act on all
-accounts, or change an order it did not place. Every armed call is appended to
-`Documents\NinjaTrader 8\nt8mcp\orders.jsonl`. To end flat after a test, use the ops module's
-`nt_flatten`.
+Playback, touch the Backtest account, or act on all accounts at once
+(`Account.FlattenEverything()` is never called anywhere in this repository). It **can** change or
+cancel any working order on the gated account, not only the ones it placed itself — the plan names
+the order's owner (`module` / `strategy <name>` / `atm` / `manual`) before you confirm. Every
+armed call is appended to `Documents\NinjaTrader 8\nt8mcp\orders.jsonl`. To end flat after a test,
+use `nt_position_close` or the ops module's `nt_flatten`.
+
+## Strategies on Sim (opt-in)
+
+Closes the loop: write a strategy, compile it, backtest it, then run it for real on a Simulator or
+Playback account and read the fills back. Same arming file as the order module
+(`orders.enabled`), same gate chain. Full contract: `docs/api/strategyrun.md`.
+
+| Tool | Does |
+|---|---|
+| `nt_strategy_start(strategy, account, instrument, bars_period, inputs=None, days_to_load=None, confirm=None, issued_at=None)` | Add a strategy to NinjaTrader's own Control Center Strategies grid, enabled, on a Simulator/Playback account |
+| `nt_strategy_stop(id, account, confirm=None, issued_at=None)` | Disable the strategy and remove its grid row; reports the position and working orders left behind. It does not flatten |
+| `nt_strategy_runs()` | State, position, working orders and realized P&L for the strategies this server started |
+
+The strategy is added to NinjaTrader's own grid, so the user always sees the row and can disable
+it by hand. After a NinjaScript reload the module no longer knows the ids of the instances it
+started — they keep running and keep their grid row, and are disabled there by hand; the grid row
+is the safety feature, not a nicety. Use `nt_position_close` to flatten what a stopped strategy
+left behind.
+
+## ATM strategies (opt-in, Simulator only)
+
+An ATM strategy is NinjaTrader's own bracket manager: one saved template holds a quantity, a stop
+loss and a profit target, and `nt_atm_start` sends one entry order under it — NinjaTrader then
+arms and manages that template's stop and target itself, on the fill. Same gate chain as the order
+module. Full contract: `docs/api/atm.md`.
+
+| Tool | Does |
+|---|---|
+| `nt_atm_templates()` | The saved ATM templates and the bracket parameters read out of each one |
+| `nt_atm_status(account=None)` | The ATM strategies still working: entry, stop, target and the position they hold |
+| `nt_atm_start(account, instrument, action, order_type, quantity, template, limit_price=None, stop_price=None, tif=None, confirm=None, issued_at=None)` | Send one entry order under a saved ATM template |
+| `nt_atm_close(account, atm_id, confirm=None, issued_at=None)` | Cancel one ATM's working orders and flatten the position it holds |
+| `nt_atm_change(account, atm_id, stop_price=None, target_price=None, target_index=None, confirm=None, issued_at=None)` | Move a running ATM's stop and/or target to a new price |
+
+All five are exercised against a live NinjaTrader 8.1.8.2 install: a Market entry with a saved
+template filled, the template's stop and target went out at the right offsets, `nt_atm_change`
+moved the target and the stop, and `nt_atm_close` left the account flat with no working orders.
+NinjaTrader requires the entry order of an ATM strategy to be named `Entry`; the module does that.
+
+## Playback control and the replay bench (opt-in)
+
+Drives the Market Replay clock, and compares what it produces against a backtest. Same arming
+file as the order module (`orders.enabled`); the Playback connection must already be Connected —
+these tools never connect or disconnect it. Full contract: `docs/api/playback.md`,
+`docs/api/reconcile.md`.
+
+| Tool | Does |
+|---|---|
+| `nt_playback_seek(time, wait_s=30)` | Move the replay clock to a time and read it back |
+| `nt_playback_speed(speed)` | Play (>=1) or pause (0) — writing this property IS the play/pause control |
+| `nt_playback_run(to, from_time="", speed=1, wait_s=910)` | Run a bounded replay job: seek, play, watch, always pause and report at the end |
+| `nt_playback_run_status(id)` | Status of one run job |
+| `nt_playback_run_cancel(id)` | Cancel a queued or running job |
+| `nt_reconcile(backtest_id="", backtest_run_id="", backtest_trades=None, playback_run_id="", playback_executions=None, tolerance_ticks=1, tolerance_seconds=60, tick_size=None)` | Pair a backtest's trades against a replay run's real fills: matched pairs, fills on only one side, and a plain verdict |
+
+Proven on a live NinjaTrader 8.1.8.2 install: 3 replay hours played in 55 wall-clock seconds at
+200x with a strategy running on Playback101, 19 fills collected. A `run` job re-checks every gate
+— the arming file included — every few seconds while it plays, and always pauses the clock and
+reports before returning, even when a gate trips mid-run. `nt_reconcile` never starts a backtest,
+a playback run or an order; a price gap between the two sides usually means the historical and
+replay data stores hold different data for that day, not a fill-model bug (see
+`docs/api/reconcile.md`).
 
 ## Ops module (opt-in)
 
@@ -496,9 +608,12 @@ between dry-run and confirm) are covered by the automated test suite instead of 
 - **Backtests use the Backtest account only.** A request that names another account is refused.
 - **Local only.** The AddOn listens on `localhost:7891`. Nothing is sent to any server by this
   project; your code, charts and account data stay on your machine.
-- **Two opt-in features, each armed by an empty file you create by hand**, each ignored again
-  after 24 hours: `orders.enabled` (Simulator-only order entry) and `ops.enabled` (the ops
-  module above). No tool, script or test in this repository creates either file for you.
+- **Two opt-in files, each armed by an empty file you create by hand**, each ignored again
+  after 24 hours: `orders.enabled` and `ops.enabled`. No tool, script or test in this repository
+  creates either file for you. `orders.enabled` now arms four things behind one file: order entry
+  (including brackets, close and reverse), ATM strategies, strategies-on-Sim, and the Playback
+  seek/speed/run controls — all Simulator/Playback only, all gated the same way. `ops.enabled`
+  arms the separate, reduce-only ops module below.
 - **Live-connection guards.** An assembly reload and both ops actions are refused while a
   connection that can route orders to a real broker is up. A broker *demo* counts as live, on
   purpose: the guard asks "can this connection send an order", not "is this real money".

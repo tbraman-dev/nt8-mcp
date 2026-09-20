@@ -734,6 +734,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 			long outCursor = OutputHub.Lines.Seen;		// cursor at job START, read to "now" at job end — never a listener of our own, the ring already is one
 			try
 			{
+				// High fill resolution + a strategy that adds a data series: NinjaTrader answers with a modal
+				// dialog and runs nothing. Find it out on a throwaway instance first, so the job is refused
+				// with NinjaTrader's own sentence and no dialog is left on the user's screen.
+				if (string.Equals(job.Settings.FillResolution, "High", StringComparison.OrdinalIgnoreCase)
+					&& Backtest_SeriesCountProbe(job) > 1)
+					throw new Exception("NinjaTrader: 'High' Order Fill Resolution is only available for single-series strategies. "
+						+ "For multi-series strategies, please program directly into your strategy the more granular resolution you would like to simulate order fills with.");
+
 				s = Configure(job);
 				lock (jobGate) { job.Strat = s; job.TearingDown = false; }
 				if (job.Cancel) return;		// a DELETE/shutdown landed while we were inside Configure(); don't run
@@ -791,7 +799,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			bool capped = clock.HasValue && job.To > clock.Value;
 			bool known = job.BarsFrom != DateTime.MinValue;
 			bool outside = known && (job.BarsTo < job.From || job.BarsFrom > job.To);
-			bool shortWindow = known && (job.BarsFrom > job.From || job.BarsTo < job.To);		// a superset of `outside` — any coverage gap, not only a total miss
+			// By DATE: a session ends before midnight, so comparing times called every full day "short".
+			bool shortWindow = known && (job.BarsFrom.Date > job.From.Date || job.BarsTo.Date < job.To.Date);		// a superset of `outside` — any coverage gap, not only a total miss
 			var warnings = new List<string>();
 			if (!capped && (outside || !known))
 			{
@@ -812,6 +821,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// demand, so the fix is usually "connect one", not "wait".
 			if (shortWindow && !capped && !AnyNonSimConnected())
 				warnings.Add("connect a data provider: a backtest fetches missing bars from the connected provider on demand");
+			string roll = Backtest_RolloverWarning(job);
+			if (roll != null) warnings.Add(roll);
 			if (warnings.Count == 0) return;
 			job.WarningsJson = Arr(warnings.Select(Q));
 			foreach (var w in warnings) Log(job.Id + " WARNING " + w);
@@ -823,18 +834,79 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// regardless of what BarsFrom happens to read. Otherwise, no bars ever loaded is the general "never ran"
 		/// signal (0.04s "done", zero trades, barsFrom null); a standing NinjaTrader dialog, if one is up, is more
 		/// informative than the generic text and is marked as NinjaTrader's own words.</summary>
+		/// <summary>A dated futures contract, tested on days BEFORE it became the front month. Observed on
+		/// 8.1.8.2 with a broker data feed: the minute history stored for the December contract on a day
+		/// before the rollover held the same prices as the September contract's, while a Market Replay
+		/// recording of the same day held the December contract's own prices, a calendar spread away.
+		/// A backtest there measures the front-month contract of that day. Nothing here can tell which
+		/// series a provider served, so this only says when the window crosses that line. null = no
+		/// warning (not a future, no rollover data, or the window starts on or after the rollover).</summary>
+		private static string Backtest_RolloverWarning(Job job)
+		{
+			try
+			{
+				Instrument inst = job.Instrument;
+				if (inst == null || inst.MasterInstrument == null) return null;
+				if (inst.MasterInstrument.InstrumentType != InstrumentType.Future) return null;
+				DateTime expiry = inst.Expiry;
+				if (expiry == DateTime.MinValue) return null;
+				var rolls = inst.MasterInstrument.RolloverCollection;
+				if (rolls == null) return null;
+				foreach (var r in rolls)
+				{
+					if (r == null || r.ContractMonth.Year != expiry.Year || r.ContractMonth.Month != expiry.Month) continue;
+					if (job.From.Date >= r.Date.Date) return null;
+					return "rollover: " + job.InstrumentName + " became the front month on "
+						+ r.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ", and this window starts on "
+						+ job.From.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ". For the days before the rollover a data provider "
+						+ "can serve the PREVIOUS contract's prices under this contract's name (a calendar spread away from this "
+						+ "contract's own prices). Test those days on the contract that was the front month then, or compare with a "
+						+ "replay of the same day (nt_reconcile)";
+				}
+			}
+			catch (Exception ex) { Log(job.Id + " rollover check: " + Deep(ex)); }
+			return null;
+		}
+
+		/// <summary>How many data series this strategy declares, read from a throwaway instance driven to
+		/// State.Configure on STANDARD fill resolution (so the probe itself cannot raise the dialog).
+		/// -1 = could not tell; the caller then runs the job and relies on Backtest_VerifyRan.</summary>
+		private static int Backtest_SeriesCountProbe(Job job)
+		{
+			StrategyBase p = null;
+			try
+			{
+				p = Configure(job);
+				p.OrderFillResolution = OrderFillResolution.Standard;
+				// Count what the STRATEGY adds: the recipe itself can put more than one period in before
+				// Configure (observed: a single-series strategy reads 2 here on a High request).
+				int before = p.BarsPeriods != null ? p.BarsPeriods.Length : 0;
+				p.SetState(State.Configure);
+				int after = p.BarsPeriods != null ? p.BarsPeriods.Length : -1;
+				Log(job.Id + " series-count probe: " + before + " period(s) before Configure, " + after + " after");
+				return after < 0 ? -1 : (after > before ? 2 : 1);
+			}
+			catch (Exception ex) { Log(job.Id + " series-count probe: " + Deep(ex)); return -1; }
+			finally { if (p != null) { try { TearDown(p); } catch { } } }
+		}
+
 		private static void Backtest_VerifyRan(Job job, StrategyBase s)
 		{
-			int seriesCount = 0;
-			try { seriesCount = s.BarsArray != null ? s.BarsArray.Length : 0; } catch { }
-			if (seriesCount > 1 && string.Equals(job.Settings.FillResolution, "High", StringComparison.OrdinalIgnoreCase))
-				throw new Exception("NinjaTrader: 'High' Order Fill Resolution is only available for single-series strategies. "
-					+ "For multi-series strategies, please program directly into your strategy the more granular resolution you would like to simulate order fills with.");
+			// No series count here: on a High request NinjaTrader adds its own fill series, so BarsArray
+			// holds 2 after a good single-series run. Multi-series + High is refused BEFORE the run
+			// (Backtest_SeriesCountProbe), where only the series the strategy adds are counted.
 			if (job.BarsFrom == DateTime.MinValue)
 			{
+				// NinjaTrader raises its dialog a moment AFTER the run returns: give it up to 1.5 s.
 				string modal = null;
-				try { modal = StandingModal(); } catch { }
-				throw new Exception(modal != null ? "NinjaTrader: " + modal : "the strategy never started / no bars loaded");
+				for (int i = 0; i < 6 && modal == null; i++)
+				{
+					try { modal = StandingModal(); } catch { }
+					if (modal == null) Thread.Sleep(250);
+				}
+				throw new Exception(modal != null
+					? "the strategy never started: NinjaTrader is showing a dialog titled '" + modal + "' — its text says why; close it (GET /health.standingModal)"
+					: "the strategy never started / no bars loaded");
 			}
 		}
 

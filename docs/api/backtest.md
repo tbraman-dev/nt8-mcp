@@ -127,15 +127,27 @@ A job whose strategy never really ran must never report `state:"done"`. Four cas
 on NinjaTrader 8.1.8.2 and all fixed at the boundary this repo controls:
 
 1. **No bars ever loaded.** If `barsFrom` would still be `null` when the run finishes, the job
-   ends `state:"error"` instead of `"done"`. `error` is NinjaTrader's own standing-dialog text when
-   one is up (prefixed `"NinjaTrader: "`), else `"the strategy never started / no bars loaded"`.
+   ends `state:"error"` instead of `"done"`. When NinjaTrader is showing a dialog, `error` names
+   its title and says to close it (NinjaTrader raises the dialog a moment after the run returns,
+   so the job waits up to 1.5 s for it); else `"the strategy never started / no bars loaded"`.
 2. **Multi-series + `fillResolution:"High"`.** NinjaTrader itself refuses this combination — "'High'
    Order Fill Resolution is only available for single-series strategies. For multi-series
    strategies, please program directly into your strategy the more granular resolution you would
    like to simulate order fills with." — but only shows a modal and returns a fast, empty
-   `SystemPerformance` instead of raising. Detected once `BarsArray.Length > 1` is known (after
-   `Configure`), and the job ends `state:"error"` with NinjaTrader's own sentence, whether or not
-   `barsFrom` also came back null.
+   `SystemPerformance` instead of raising. It is refused BEFORE the run: a throwaway instance is
+   driven to `State.Configure` on Standard fill resolution and only the periods the STRATEGY adds
+   are counted, so NinjaTrader never shows its dialog and the job ends `state:"error"` with
+   NinjaTrader's own sentence. The count is never taken after a run: on a High request NinjaTrader
+   adds a fill series of its own, so `BarsArray` holds 2 after a good single-series run (observed on
+   8.1.8.2). Single-series + High runs normally.
+   **Rollover.** `warnings` carries a `rollover:` entry when the instrument is a dated futures
+   contract and the window starts before the date that contract became the front month
+   (`MasterInstrument.RolloverCollection`). Observed on 8.1.8.2 with a broker data feed: for a day
+   before the rollover, the stored minute history of the December contract held the same prices as
+   the September contract's, while a Market Replay recording of that day held the December
+   contract's own prices, a calendar spread away. A backtest there measures the contract that was
+   the front month on that day. The tool cannot tell which series a provider served; it says when
+   the window crosses the line, and `nt_reconcile` against a replay shows the size of the gap.
 3. **An unresolvable or continuous-contract instrument.** `instrument` is resolved before the job is
    queued. Unknown name → `400 {"error":"unknown instrument '<name>'"}`. A name that resolves but is
    a continuous-contract reference (no dated expiry — `"ES"`, `"ES ##-##"`) → `400` naming a dated

@@ -2,14 +2,21 @@
 
 The AddOn (`addon/NT8Bridge*.cs`) runs inside NinjaTrader 8 and listens on
 `http://localhost:7891/`. **It is read-only by default.** No order or account-changing
-endpoint exists unless you opt in. Two opt-in, disarmed-by-default modules exist: ops
-(flatten, a naked-position watchdog, reconnect and a restart CLI) — see
-[Ops (opt-in, disarmed by default)](#ops-opt-in-disarmed-by-default-batch-3) — and order entry
-on Simulator and Playback accounts only — see
-[Orders (opt-in, disarmed by default, Simulator only)](#orders-opt-in-disarmed-by-default-simulator-only).
-Each has its own arming file; neither file arms the other module. Outside
-that module, writes are limited to `reload`, `screenshot`, `compile`/`compile?reload=1`, and
-the opt-in, flag-gated `data/download`.
+endpoint exists unless you opt in. Two arming files gate every opt-in module: `ops.enabled` gates
+the reduce-only ops module (flatten, a naked-position watchdog, reconnect and a restart CLI) — see
+[Ops (opt-in, disarmed by default)](#ops-opt-in-disarmed-by-default-batch-3) — and `orders.enabled`
+gates four Simulator/Playback-only modules that share one gate chain: order entry (submit,
+bracket, change, cancel, close, reverse — see
+[Orders (opt-in, disarmed by default, Simulator only)](#orders-opt-in-disarmed-by-default-simulator-only)),
+ATM strategies (see [ATM strategies](#atm-strategies-opt-in-disarmed-by-default-simulator-only)),
+strategies on a Simulator account (see
+[Strategies on Sim](#strategies-on-sim-opt-in-disarmed-by-default)), and the Playback
+seek/speed/run driver (see
+[Playback control](#playback-control-opt-in-disarmed-by-default)). Neither arming file arms the
+other module's gate chain. Outside these, writes are limited to `reload`, `screenshot`, chart
+control (`indicator/add`, `indicator/remove`, `series`, `scroll` — no arming file, no account
+touched, see [Chart control](#chart-control-module-chartcontrol-addonnt8bridgechartcontrolcs)),
+`compile`/`compile?reload=1`, and the opt-in, flag-gated `data/download`.
 
 All responses are JSON, UTF-8. Errors: HTTP 4xx/5xx with `{"error":"message"}`.
 Times are ISO-8601 local NT8 time, `yyyy-MM-ddTHH:mm:ss`, no zone, unless a section says
@@ -45,8 +52,12 @@ method directly (`addon/NT8Bridge.cs`): it matches exactly `health`, `windows`, 
 | `NT8Bridge.Feeds.cs` | `Route_Feeds` | `/feedhealth`, `/connections` |
 | `NT8Bridge.Data.cs` | `Route_Data` | `/data/coverage`, `/data/download[/{id}]` |
 | `NT8Bridge.Workspace.cs` | `Route_Workspace` | `/workspace`, `/strategies/running`, `/screenshot` |
-| `NT8Bridge.Playback.cs` | `Route_Playback` | `/playback` |
+| `NT8Bridge.Playback.cs` | `Route_Playback` | `/playback` (read), `/playback/seek`, `/playback/speed`, `/playback/run[/{id}]` (opt-in, disarmed by default) |
+| `NT8Bridge.ChartControl.cs` | `Route_ChartControl` | `/chart/{id}/indicator/add`, `/chart/{id}/indicator/remove`, `/chart/{id}/series`, `/chart/{id}/scroll` |
 | `NT8BridgeOps.cs` | `Route_Ops` | `/ops/status`, `/ops/flatten`, `/ops/reconnect` (opt-in, disarmed by default) |
+| `NT8BridgeOrders.cs` | `Route_Orders` | `/orders/status`, `/orders/{submit,bracket,change,cancel,close,reverse}` (opt-in, disarmed by default, Simulator only) |
+| `NT8BridgeAtm.cs` | `Route_Atm` | `/atm/templates`, `/atm/status`, `/atm/{start,close,change}` (opt-in, disarmed by default, Simulator only) |
+| `NT8BridgeStrategyRun.cs` | `Route_StrategyRun` | `/strategy/{start,stop,running}` (opt-in, disarmed by default, Simulator only) |
 
 `nt_optimize`, `nt_walkforward` and `nt_report` add no AddOn file and no HTTP endpoint: they
 are pure Python over `POST /backtest` + `GET /backtest/{id}` (see
@@ -76,7 +87,7 @@ accepts `first` (the first chart found).
 ### `GET /health`
 
 ```json
-{ "ok": true, "addonVersion": "1.3.1", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
+{ "ok": true, "addonVersion": "1.4.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
   "connections": [{"name":"Sim101 feed","status":"Connected","provider":"Simulator","canManageOrders":false}],
   "charts": 1, "anyLive": false, "anyNonSim": true, "standingModal": null,
   "pid": 12345, "processStartUtc": "2026-09-18T08:59:50Z",
@@ -686,12 +697,13 @@ hwnd, path)`.
 
 ---
 
-## Playback module (read side only, `addon/NT8Bridge.Playback.cs`)
+## Playback module (read, `addon/NT8Bridge.Playback.cs`)
 
-One read-only endpoint. **There is no write side and there will not be one here** — this
-module never connects, disconnects, seeks, or writes the replay speed. Writing that property
-*is* the play button, so a deliberate design decision keeps this module read-only: only the
-getter of the speed property is bound.
+One read-only endpoint. **This endpoint itself never connects, disconnects, seeks, or writes the
+replay speed** — it only reads. The opt-in write side that does move the clock (`/playback/seek`,
+`/playback/speed`, `/playback/run`) is a separate, gated set of endpoints — see
+[Playback control (opt-in, disarmed by default)](#playback-control-opt-in-disarmed-by-default)
+below.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -884,34 +896,149 @@ section is the summary.
 
 | Method | Path | Returns |
 |---|---|---|
-| GET | `/orders/status` | armed?, flag age, the caps in force, the Simulator / Playback accounts that are valid targets |
+| GET | `/orders/status` | armed?, flag age, the caps in force, the Simulator / Playback accounts that are valid targets, and every live order on them with its owner |
 | POST | `/orders/submit` | dry-run `{plan, confirm, issuedAt}`, or the result of a confirmed submit |
-| POST | `/orders/change` | the same two steps for the quantity and/or prices of one working order |
-| POST | `/orders/cancel` | the same two steps for one working order |
+| POST | `/orders/bracket` | one entry + one stop + any number of targets, under one plan and one confirm |
+| POST | `/orders/change` | the same two steps for the quantity and/or prices of ANY live order |
+| POST | `/orders/cancel` | the same two steps for ANY live order |
+| POST | `/orders/close` | cancel one instrument's working orders on one account, then flatten it |
+| POST | `/orders/reverse` | the same, then enter the same quantity on the other side |
 
-**MCP: exactly three tools**, `nt_order_submit`, `nt_order_change`, `nt_order_cancel`. Order types
-Market, Limit, StopMarket, StopLimit; TIF Day or Gtc; one account, one instrument, one order per
-call. No brackets, ATM strategies, OCO or all-accounts form.
+**MCP: six tools**, `nt_order_submit`, `nt_order_bracket`, `nt_order_change`, `nt_order_cancel`,
+`nt_position_close`, `nt_position_reverse`. Order types Market, Limit, StopMarket, StopLimit; TIF
+Day or Gtc; one account, one instrument per call.
+
+**Brackets and the OCO pair rule.** `/orders/bracket` takes one entry, one stop loss
+(`stopLossPrice` or `stopLossTicks`) and any number of targets, sized to the entry's real fill, not
+the requested quantity — a resting entry comes back `exitsPending:true` with nothing at the broker
+yet, and a bounded watcher submits the exits once it fills. NinjaTrader cancels every other **live**
+order in an OCO group the moment one member fills or is cancelled, so each target gets its **own**
+stop under its **own** OCO pair (one pair per target, not one shared group): cancelling a target
+only ever cancels its own paired stop, never a sibling pair's. Full mechanics: `docs/api/orders.md`.
+
+**`/orders/change` and `/orders/cancel` reach ANY live order on the gated account**, not only the
+ones this module placed — a running strategy's stop, an ATM's target, a hand-placed order. The
+plan names the order's `owner` (`module` / `strategy <name>` / `atm` / `manual`), its OCO group,
+its state and its filled quantity before you confirm.
 
 **The gate chain, in this order.** (1) The arming file `orders.enabled` beside the AddOn,
 stat-checked on every request, ignored when older than 24 h or future-dated; unarmed = `403
-{"error":"orders module not armed"}` on all four paths, before the body is parsed. `ops.enabled`
-does not arm this module. (2) The three POSTs are refused while `AnyLiveConnected()` is true; there
+{"error":"orders module not armed"}` on all seven paths, before the body is parsed. `ops.enabled`
+does not arm this module. (2) Every POST is refused while `AnyLiveConnected()` is true; there
 is no `force`. (3) The account must resolve to exactly one account whose provider is
 `Provider.Simulator` or `Provider.Playback`; a provider that cannot be read is a refusal; the
 Backtest account is refused by name. **There is no live switch: the module never reads `ops.live`
-and has no code path that accepts another provider.** (4) Validation. (5) Caps: 2 contracts per
-order, 5 working orders per account, 6 confirmed submits per minute; the optional file
-`nt8mcp\orders.config.json` changes them up to the code ceilings 10 / 20 / 30, and a value outside
-`1..ceiling` falls back to the default with a warning. (6) No `confirm` = dry run. (7) The confirm
-is an HMAC over `orders.<verb>|` + the plan (caps included) + the AddOn-stamped `issuedAt`, valid
-for 30 s, compared in fixed time, and **single-use**. (8) The call runs outside every collection
-lock; the result reports the order's true state after a bounded re-read, and `ok` never means
-"filled". (9) Every armed call is audited to `nt8mcp\orders.jsonl`; a confirmed action writes an
-intent line first and does not run if that write fails.
+and has no code path that accepts another provider.** (4) Validation. (5) Caps: 10 contracts per
+order, 20 working orders per account, 60 confirmed submits per minute; the optional file
+`nt8mcp\orders.config.json` changes them up to the code ceilings 100 / 100 / 600, and a value
+outside `1..ceiling` falls back to the default with a warning. A bracket's exits are exempt from
+the working-order cap (the account's hard ceiling of 100 live orders in code still applies).
+(6) No `confirm` = dry run. (7) The confirm is an HMAC over `orders.<verb>|` + the plan (caps
+included) + the AddOn-stamped `issuedAt`, valid for 30 s, compared in fixed time, and
+**single-use**. (8) The call runs outside every collection lock; the result reports the order's
+true state after a bounded re-read, and `ok` never means "filled". (9) Every armed call is
+audited to `nt8mcp\orders.jsonl`; a confirmed action writes an intent line first and does not run
+if that write fails.
 
-`change` and `cancel` act only on orders this module placed (after a NinjaScript reload it adopts
-its own working orders again, by order name, on Simulator / Playback accounts only).
+`/orders/close` and `/orders/reverse` cancel one instrument's working orders on one account, then
+flatten it (`reverse` also enters the same quantity the other side); `Account.FlattenEverything()`
+is never called anywhere in this repository. Full contract, every field and status code:
+`docs/api/orders.md`.
+
+---
+
+## ATM strategies (opt-in, disarmed by default, Simulator only)
+
+An ATM strategy is NinjaTrader's own bracket manager: a saved template holds a quantity, a stop
+loss and a profit target, and `/atm/start` sends one entry order under it — NinjaTrader then arms
+and manages that template's stop and target itself, on the fill. Every write goes through the
+**same** gate chain as `/orders/*` (`orders.enabled`, the live-routing refusal, the provider test,
+the caps, the signed one-shot confirm, the same audit log). Full contract, including the
+NinjaTrader internals this depends on and what is still unconfirmed: `docs/api/atm.md`.
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/atm/templates` | the saved templates: names and the bracket parameters read from the files |
+| GET | `/atm/status` | the ATM strategies with a live order or an open position, with entry/stops/targets |
+| POST | `/atm/start` | dry-run `{plan, confirm, issuedAt}`, or the result of a confirmed start |
+| POST | `/atm/close` | cancel one ATM's working orders and flatten the position it holds |
+| POST | `/atm/change` | move one ATM's stop and/or target to a new price |
+
+**MCP: five tools**, `nt_atm_templates`, `nt_atm_status`, `nt_atm_start`, `nt_atm_close`,
+`nt_atm_change`. All five endpoints are exercised against a live NinjaTrader 8.1.8.2 install.
+NinjaTrader requires the entry order of an ATM strategy to be named `Entry`, and the entry is sent
+with `Account.Submit` after `AtmStrategy.StartAtmStrategy` has attached the template.
+
+---
+
+## Strategies on Sim (opt-in, disarmed by default)
+
+Closes the loop: write a strategy, compile it, backtest it, then run it for real on a Simulator or
+Playback account and read the fills back. A strategy places its own orders, so this sits behind
+the **same** gate chain as `/orders/submit`. Full contract, including the NinjaTrader internals
+this depends on: `docs/api/strategyrun.md`.
+
+| Method | Path | Returns |
+|---|---|---|
+| POST | `/strategy/start` | dry-run `{plan, confirm, issuedAt}`, or the result of a confirmed start |
+| POST | `/strategy/stop` | the same two steps for one instance this module started. It does not flatten |
+| GET | `/strategy/running` | the instances this module started, with state, position, working orders, realized PnL |
+
+**MCP: three tools**, `nt_strategy_start`, `nt_strategy_stop`, `nt_strategy_runs`. The strategy is
+added to NinjaTrader's own Control Center Strategies grid, enabled, so the user sees the row and
+can disable it by hand; after a NinjaScript reload the module no longer knows the ids of the
+instances it started, but the grid rows survive and the user disables them there.
+
+---
+
+## Chart control (module `chartcontrol`, `addon/NT8Bridge.ChartControl.cs`)
+
+Never touches an account: no arming file, no provider check, no audit log. The
+write -> compile -> put on chart -> look -> fix loop for a chart's indicators and series. Full
+contract: `docs/api/chartcontrol.md`.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| POST | `/chart/{id}/indicator/add` | `{"indicator","inputs":{},"panel":0}` | the chart report |
+| POST | `/chart/{id}/indicator/remove` | `{"indicator" \| "index", "force":false}` | the chart report |
+| POST | `/chart/{id}/series` | `{"instrument","barsPeriod":{"type","value"}}` | the chart report |
+| POST | `/chart/{id}/scroll` | `{"time"}` | the chart report |
+
+**MCP:** `nt_chart_indicator_add`, `nt_chart_indicator_remove`, `nt_chart_set_series`,
+`nt_chart_scroll_to`, plus the Python-only `nt_trade_shot` (scroll to a saved/live backtest
+trade's entry, then screenshot). `indicator/add`, `indicator/remove` and `scroll` are confirmed
+against a live NinjaTrader 8.1.8.2 install. `series` takes `{"restore":true}` to put back exactly
+what the chart showed before the module first changed it.
+
+---
+
+## Playback control (opt-in, disarmed by default)
+
+The read side, `GET /playback` (see [Playback module (read)](#playback-module-read-addonnt8bridgeplaybackcs)
+above), never connects, disconnects, seeks or writes the replay speed. `/playback/seek`,
+`/playback/speed` and `/playback/run` do, and are opt-in behind the **same** `orders.enabled` file
+the order module reads: gated on a Connected Playback connection (never connected/disconnected by
+this module), no non-Playback account holding a position or a working order, and no modal dialog.
+There is no HMAC confirm here — moving a replay clock is not an order — but every armed call is
+one line in `nt8mcp\playback.jsonl`. Full contract: `docs/api/playback.md`.
+
+| Method | Path | Returns |
+|---|---|---|
+| POST | `/playback/seek` `{"time","waitSec"}` | reposition the replay clock |
+| POST | `/playback/speed` `{"speed"}` | play (>=1) or pause (0) — writing this property IS the play/pause control |
+| POST | `/playback/run` `{"from","to","speed","stopAtEnd":true}` | queue a bounded run job |
+| GET | `/playback/run/{id}` | that job's status document |
+| DELETE | `/playback/run/{id}` | cancel it |
+
+**MCP:** `nt_playback_seek`, `nt_playback_speed`, `nt_playback_run`, `nt_playback_run_status`,
+`nt_playback_run_cancel`. Proven on a live NinjaTrader 8.1.8.2 install: 3 replay hours played in
+55 wall-clock seconds at 200x with a strategy running on Playback101, 19 fills collected. A `run`
+job re-checks every gate every few seconds while it plays and always pauses and reports, even when
+a gate trips mid-run.
+
+`nt_reconcile` (`server/nt8_mcp/tools_reconcile.py`, no AddOn endpoint of its own) pairs a
+backtest's trades against a `/playback/run` job's real fills — matched pairs with price/time
+deltas, fills on only one side, and a plain verdict. Full contract: `docs/api/reconcile.md`.
 
 ## Threading rules (for the AddOn author)
 
