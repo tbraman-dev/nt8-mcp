@@ -93,6 +93,27 @@ else:
     print("OK:barsFrom=%s barsTo=%s warnings=%d" % (d["barsFrom"], d["barsTo"], len(d["warnings"])))
 ' "$BODY_FILE")
     check_result "GET /backtest/$BT_ID loaded window keys" "$R"
+
+    # 17c. equity is always an array, outputNote is present
+    # (null on a clean capture — SampleMACrossOver does not Print()), and a real 76-trade run is not
+    # "not meaningful": sharpe/profitFactor should be numbers here, not null.
+    R=$(pycheck '
+import json, sys
+d = json.load(open(sys.argv[1]))
+eq = d.get("equity")
+s = d.get("summary") or {}
+if "outputNote" not in d:
+    print("ERR:no outputNote key")
+elif not isinstance(eq, list):
+    print("ERR:equity is %r" % (eq,))
+elif eq and not ("time" in eq[0] and "cumulativeNetProfit" in eq[0]):
+    print("ERR:equity row missing keys: %r" % (eq[0],))
+elif s.get("trades", 0) >= 2 and s.get("sharpe") is None:
+    print("ERR:sharpe null with %s trades" % s.get("trades"))
+else:
+    print("OK:equity rows=%d outputNote=%r sharpe=%r" % (len(eq), d.get("outputNote"), s.get("sharpe")))
+' "$BODY_FILE")
+    check_result "GET /backtest/$BT_ID equity/outputNote" "$R"
   fi
 
   # 18. GET /backtests lists it
@@ -123,6 +144,25 @@ else:
     R="ERR:http $HTTP_CODE"
   fi
   check_result "DELETE /backtest/$BT_ID" "$R"
+fi
+
+# ── instrument resolution & the never-silently-done fixes ────────────
+
+# 13b. Unknown instrument -> 400 at request time, never a queued job.
+post_json "/backtest" '{"strategy":"SampleMACrossOver","instrument":"NotAnInstrument_xyz","barsPeriod":{"type":"Minute","value":5},"from":"2026-09-10","to":"2026-09-17"}'
+if [ "$HTTP_CODE" = "400" ]; then
+  report PASS "/backtest unknown instrument" "http 400 as expected"
+else
+  report FAIL "/backtest unknown instrument" "expected http 400, got $HTTP_CODE"
+fi
+
+# 13c. A continuous-contract style instrument name -> 400 naming the problem, not a silent 0-trade
+# "done" ("ES" and "ES ##-##" both resolve and both would otherwise silently produce barsFrom:null).
+post_json "/backtest" '{"strategy":"SampleMACrossOver","instrument":"ES ##-##","barsPeriod":{"type":"Minute","value":5},"from":"2026-09-10","to":"2026-09-17"}'
+if [ "$HTTP_CODE" = "400" ]; then
+  report PASS "/backtest continuous-contract instrument" "http 400 as expected"
+else
+  report FAIL "/backtest continuous-contract instrument" "expected http 400, got $HTTP_CODE body=$(cat "$BODY_FILE")"
 fi
 
 # ── templates / settings ──────────────────────────────────────────────────────

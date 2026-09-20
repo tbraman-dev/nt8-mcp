@@ -20,8 +20,11 @@ Sim or live account, an order, a chart or the Strategy Analyzer window.
 ```python
 nt_optimize(strategy, params, chart="first", instrument="", bars_period=None,
             from_date="", to_date="", tick_replay=False, inputs=None,
+            fill_resolution="", fill_resolution_type="", fill_resolution_value=0,
+            slippage_ticks=None, commission_template="", include_commission=None,
+            fill_limit_on_touch=None,
             fitness="netProfit", top_n=10, min_trades=5,
-            max_combos=200, max_runs=0, wait_s=600)
+            max_combos=200, max_runs=0, wait_s=600, include_trades=False)
 ```
 
 `chart` / `instrument` / `bars_period` / `from_date` / `to_date` / `tick_replay` / `inputs` are
@@ -32,6 +35,18 @@ the grid's values are merged over it per run. `chart` is sent whenever it is tru
 `nt_backtest` uses — even alongside an explicit `instrument`/`bars_period`: the AddOn's explicit
 instrument/bar-period already override the chart's seed values, but the chart still supplies
 `TradingHours` and `ResetOnNewTradingDay`, so dropping it changed which bars a combo saw.
+
+### Costs
+
+`fill_resolution`, `fill_resolution_type`, `fill_resolution_value`, `slippage_ticks`,
+`commission_template`, `include_commission`, `fill_limit_on_touch` — same names, same JSON keys
+(`fillResolution`, `fillResolutionType`, `fillResolutionValue`, `slippageTicks`,
+`commissionTemplate`, `includeCommission`, `fillLimitOnTouch`) and the same semantics as
+`nt_backtest` (`docs/api/backtest.md`) — are passed straight through to **every** inner
+`POST /backtest` call the grid makes. One tick of slippage can flip a strategy's sign; a fitness
+computed on a gross run can rank the wrong parameter set. Nothing here recomputes or estimates a
+cost — every one of these is NinjaTrader's own simulation, echoed back verbatim in the top-level
+`costs` object (see "Result" below) so a consumer never has to guess whether a number is gross.
 
 ### `params`
 
@@ -130,51 +145,84 @@ No probe run is made to estimate the wall clock: "nothing run" means no backtest
 {"strategy": "SampleMACrossOver", "fitness": "netProfit", "fitnessKey": "netProfit",
  "grid": {"Fast": [5, 10, 15]}, "combos": 3, "ran": 3, "ranked": 3,
  "from": "2026-09-10", "to": "2026-09-17", "minTrades": 5,
+ "costs": {"slippageTicks": 1, "commissionTemplate": "Default", "includeCommission": true,
+   "fillResolution": null, "fillResolutionType": null, "fillResolutionValue": null,
+   "fillLimitOnTouch": null},
  "rows": [
    {"id": "b2", "state": "done", "inputs": {"Fast": 10}, "fitness": 300.0,
     "summary": {"trades": 12, "netProfit": 300.0, "...": "all 21 summary keys"},
     "skipped": null, "seconds": 0.71, "rank": 1},
    {"id": "b3", "state": "done", "inputs": {"Fast": 15}, "fitness": 200.0, "summary": {"...": "…"},
     "skipped": null, "seconds": 0.69, "rank": 2}],
- "best": {"id": "b2", "state": "done", "...": "the winner's FULL status document, trades[] and all"},
+ "best": {"id": "b2", "state": "done", "...": "the winner's FULL status document",
+   "trades": null},
  "errors": [], "warnings": []}
 ```
+
+Null rules:
+
+| Key | Type | Null? | Meaning |
+|---|---|---|---|
+| `costs` | object | never | every field below is `null` when that setting was never passed; see "Costs" |
+| `costs.note` | string | **present only when every cost field is null** | literally `"gross: no slippage or commission modelled"` |
+| `best` | object | null only when `ran == 0` or every row was skipped | the winner's full status document |
+| `best.trades` | array | **null unless `include_trades=True`** | the winner's own status-document `trades[]`, or `null` when withheld |
+| `rows[].skipped` | string | null for a row that qualified and could win | see below for the reasons |
+| `rows[].rank` | int | absent (not `null` — the key is left out) on a skipped row | 1-based, best first |
 
 - `rows` is best-first, truncated to `top_n`, **followed by every skipped row** (a skipped row has
   `skipped: <reason>` and no `rank`). Sort or filter it yourself for a Pareto view — multi-objective
   is "read two columns of this table", not a second run.
-- `rows[].summary` is the whole `summary` object; `trades[]` is dropped from every row. Only `best`
-  carries trades (500 combos × full trades is a memory bomb). To reproduce a row's numbers, call
-  `nt_backtest(strategy, inputs=row["inputs"], instrument=..., bars_period=..., chart=..., from_date=...,
-  to_date=..., **tick_replay=False**)` — the same `instrument`/`bars_period`/`chart`/dates the grid ran
-  with, and **`tick_replay=False` explicitly**: `nt_optimize` defaults it to `False`, `nt_backtest`
-  defaults it to `True`, and running the reproduction with Tick Replay on gets different fills (and a
-  different `netProfit`) for any strategy that reads the tape in `OnMarketData`.
+- `rows[].summary` is the whole `summary` object; `trades[]` is never in a row (500 combos × full
+  trades is a memory bomb). Only `best` can carry trades, and only when `include_trades=True` — by
+  default `best.trades` is `null` even though the winner's own status document had a real array. To
+  reproduce a row's numbers, call `nt_backtest(strategy, inputs=row["inputs"], instrument=...,
+  bars_period=..., chart=..., from_date=..., to_date=..., **tick_replay=False**)` — the same
+  `instrument`/`bars_period`/`chart`/dates/costs the grid ran with, and **`tick_replay=False`
+  explicitly**: `nt_optimize` defaults it to `False`, `nt_backtest` defaults it to `True`, and running
+  the reproduction with Tick Replay on gets different fills (and a different `netProfit`) for any
+  strategy that reads the tape in `OnMarketData`.
+- A row's `skipped` reason, in the order it is checked: (1) the run **never really ran** — its state
+  is `error`/`timeout`/`cancelled`, or it came back `"done"` with its own `barsFrom` explicitly
+  `null` (NinjaTrader raised an unhandled modal, refused the fill mode, or the instrument never
+  resolved) — this is added to `errors` too, and is the one case that overrides
+  everything else: a job that never ran is never treated as a legitimate zero-trade, zero-profit
+  result, however it reads. (2) fewer than `min_trades` trades. (3) the fitness key itself is `null`
+  in that run's summary (e.g. `profitFactor` with no losing trade). A `barsFrom` key that is simply
+  **absent** (an older `nt_backtest` build) is not case (1) — only an explicit `null` is.
 - Every combo's backtest is DELETEd from the AddOn once ranking is done, except the winner (`best`)
   and the rows this call actually returns (`rows`, which is `top_n` plus every skipped/errored row) —
   the AddOn keeps a job until DELETEd, so a 200-combo grid does not leave 200 result documents resident
   in the live NinjaTrader process. A row you want to keep querying by id should be re-run with
   `nt_backtest` rather than assumed to still exist.
 - `ranked` counts the rows that qualified before `top_n` truncation.
-- A run that **failed** (`state` `error`/`timeout`/`cancelled`) is listed with its message and added
-  to `errors`; the grid carries on.
 - A run the AddOn **refused** (no job was ever created — unknown input, bad instrument, bad date) is
-  different: every later combination would be refused the same way, so the grid stops there and the
-  result carries `error`, `refused`, `refusedInputs` and the rows that did run.
+  different from a never-ran row: every later combination would be refused the same way, so the grid
+  stops there and the result carries `error`, `refused`, `refusedInputs` and the rows that did run.
 
 ## `nt_walkforward`
 
 ```python
 nt_walkforward(strategy, params, train_days=30, test_days=10, anchored=False,
                from_date="", to_date="", chart="first", instrument="", bars_period=None,
-               tick_replay=False, inputs=None, fitness="netProfit", min_trades=5,
+               tick_replay=False, inputs=None,
+               fill_resolution="", fill_resolution_type="", fill_resolution_value=0,
+               slippage_ticks=None, commission_template="", include_commission=None,
+               fill_limit_on_touch=None,
+               fitness="netProfit", min_trades=5,
                max_combos=200, max_runs=0, max_backtests=200, wait_s=600,
-               optimization_period_days=0, test_period_days=0)
+               optimization_period_days=0, test_period_days=0, include_trades=False)
 ```
 
 `optimization_period_days` / `test_period_days` are accepted as aliases for `train_days` /
 `test_days` (names matching `StrategyBase.OptimizationPeriod` /
 `.TestPeriod`, both in DAYS); a non-zero alias wins.
+
+The cost settings (`fill_resolution`, `fill_resolution_type`, `fill_resolution_value`,
+`slippage_ticks`, `commission_template`, `include_commission`, `fill_limit_on_touch`) are the same
+as `nt_optimize`'s (see "Costs" above) and are passed to **every** inner backtest — the in-sample
+grid on each window AND the out-of-sample run — so an in-sample winner is never picked on a gross
+fitness and then validated with costs, or the reverse.
 
 Window k (0-based), all dates inclusive:
 
@@ -203,6 +251,14 @@ queuing thousands of backtests one at a time with no way to stop short of restar
 {"strategy": "SampleMACrossOver", "fitness": "netProfit", "grid": {"Fast": [5, 10]}, "combos": 2,
  "from": "2026-01-01", "to": "2026-01-20", "trainDays": 10, "testDays": 5, "anchored": false,
  "minTrades": 5,
+ "costs": {"slippageTicks": null, "commissionTemplate": null, "includeCommission": null,
+   "fillResolution": null, "fillResolutionType": null, "fillResolutionValue": null,
+   "fillLimitOnTouch": null, "note": "gross: no slippage or commission modelled"},
+ "table": [
+   {"window": 1, "inSample": {"from": "2026-01-01", "to": "2026-01-10"},
+    "outOfSample": {"from": "2026-01-11", "to": "2026-01-15"}, "inputs": {"Fast": 10},
+    "inSampleFitness": 300.0, "outOfSampleNetProfit": 320.0, "outOfSampleTrades": 8,
+    "state": "done", "error": null}],
  "windows": [
    {"window": 1,
     "inSample":    {"from": "2026-01-01", "to": "2026-01-10", "inputs": {"Fast": 10},
@@ -215,18 +271,48 @@ queuing thousands of backtests one at a time with no way to stop short of restar
                              "netProfit": 600.0, "grossProfit": 900.0, "grossLoss": -300.0,
                              "profitFactor": 3.0, "commission": 0, "maxDrawdown": -120.0,
                              "avgTrade": 75.0},
-                 "trades": [{"n": 0, "side": "Long", "qty": 1, "pnl": 112.5, "window": 1}],
+                 "trades": [],
                  "note": "summed in Python across the out-of-sample windows; …"}}
 ```
 
+### `table` — read this one first
+
+Always present, one row per window, in window order, **never** the trade lists (that's what
+`windows[]`/`outOfSample.trades` are for) — this is the compact summary in place of
+a 126 KB response with every out-of-sample trade inlined twice. Null rules:
+
+| Key | Type | Null? | Meaning |
+|---|---|---|---|
+| `window` | int | never | 1-based |
+| `inSample` / `outOfSample` | object `{from, to}` | never | the window's own date range, always present even when the window was skipped or errored |
+| `inputs` | object | **null** when no in-sample combination qualified | the winning in-sample combo, merged over the fixed `inputs` |
+| `inSampleFitness` | number | null, same condition as `inputs` | the winner's in-sample fitness value |
+| `outOfSampleNetProfit` | number | **null** unless `state == "done"` | never `0` for a run that did not really happen — see `state` |
+| `outOfSampleTrades` | int | same as `outOfSampleNetProfit` | |
+| `state` | string | never | `"done"` (a real out-of-sample result), `"error"` (the AddOn refused, the run ended in error/timeout/cancelled, or it came back `"done"` with `barsFrom` explicitly `null` — never really started), or `"skipped"` (no in-sample combination qualified, so no out-of-sample run was even attempted) |
+| `error` | string | null only when `state == "done"` | the reason, verbatim where NinjaTrader gave one |
+
+A window that reads `state: "error"` with `outOfSampleNetProfit: null` catches, for walk-forward,
+the same job that would have looked like a legitimate zero-trade
+out-of-sample result in `windows[].outOfSample.summary` (trades 0, netProfit 0, error null) is never
+folded into the top-level `outOfSample` stitched summary either — a never-ran window contributes
+nothing to `outOfSample.windows` or its summed `netProfit`.
+
+### `windows[]` and the stitched `outOfSample` — the detailed record
+
 - A window whose in-sample grid produced **no** qualifying combination gets
-  `inSample.inputs: null`, `outOfSample: null` and a `note`; it is skipped, not guessed at.
+  `inSample.inputs: null`, `outOfSample: null` and a `note`; it is skipped, not guessed at (and its
+  `table` row reads `state: "skipped"`).
 - The top-level `outOfSample` object is **status-document-shaped, but not from the AddOn**: its
   `summary` is summed in Python across the windows and its `maxDrawdown` comes from the stitched
   equity curve. It is the only place in this repo where a performance number is computed outside
   NinjaTrader, because no single NinjaTrader run spans the windows. The per-window
   `windows[].outOfSample.summary` objects are NinjaTrader's own and are the authoritative ones.
   Each stitched trade keeps its original keys plus `window`, and `n` is renumbered from 0.
+- `outOfSample.trades` is `[]` unless `include_trades=True` — the default keeps the response small.
+  With `include_trades=True` every out-of-sample trade appears there exactly
+  ONCE, in date order; it is never also duplicated per window (`windows[].outOfSample` never carries
+  a `trades` key at all).
 - It is shaped that way on purpose: hand it straight to `nt_report(status_doc=…)`.
 - A top-level `warnings` list carries the same "different window" sentences as `nt_optimize`'s (see
   *Playback*). Under normal conditions the window dates POSTed match the window dates reported and

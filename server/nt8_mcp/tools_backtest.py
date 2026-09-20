@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 
 from nt8_mcp import app  # POLL_S is read through the module so tests can patch it
+from nt8_mcp import runs
 from nt8_mcp.app import _addon_delete, _addon_get, _addon_post, mcp
 
 
@@ -48,6 +49,7 @@ def nt_backtest(
     fill_limit_on_touch: bool | None = None,
     include_trade_history: bool | None = None,
     max_trades: int = 0,
+    save_run: bool = True,
 ):
     """Run a strategy backtest and wait for it to finish, returning the final status doc (summary + trades +
     settings). Runs on the Backtest account only — no Sim or live account is ever touched. Strategies that read
@@ -57,17 +59,33 @@ def nt_backtest(
     own dates, instrument, bar period and inputs are the defaults and nothing is invented (list names with
     nt_templates; any explicit argument still wins, and chart="first" is not sent with a template unless you
     change it). Fill/cost settings: fill_resolution "Standard"|"High" (High is refused with tick_replay,
-    NinjaTrader does not allow the combination), fill_resolution_type/_value for High, slippage_ticks (>=0, in
-    ticks), commission_template (a NinjaTrader commission template name; an unknown name is refused, and
-    passing one turns include_commission on unless you pass include_commission=False), include_commission,
-    fill_limit_on_touch, include_trade_history (false empties trades[]), max_trades trims trades[] only and
-    never summary. Anything unknown or out of range is refused before the job is armed. The returned document
-    echoes every effective setting under "settings" — read back off the strategy, not from this call, because
-    several NinjaTrader setters silently no-op. ALWAYS read "barsFrom"/"barsTo" (the bars really loaded) and
+    NinjaTrader does not allow the combination, and is likewise refused — or, if that can only be known once the
+    run starts, ends the job as state "error" — for a multi-series strategy: NinjaTrader itself has no way to
+    simulate High-resolution fills across more than one series), fill_resolution_type/_value for High,
+    slippage_ticks (>=0, in ticks), commission_template (a NinjaTrader commission template name; an unknown name
+    is refused, and passing one turns include_commission on unless you pass include_commission=False),
+    include_commission, fill_limit_on_touch, include_trade_history (false empties trades[], never summary or
+    equity), max_trades trims trades[] only and never summary or equity. instrument is resolved before the job
+    is queued: an unknown name is refused with 400, and so is a continuous-contract style name (e.g. "ES" or
+    "ES ##-##") — NinjaTrader cannot backtest one, so name a dated contract such as "ES 12-26" (nt_data_coverage
+    may still list a continuous name as "resolved"; that is a different question, what local data exists, not
+    whether a backtest can use it). Anything unknown or out of range is refused before the job is armed.
+    The returned document echoes every effective setting under "settings" — read back off the strategy, not
+    from this call, because several NinjaTrader setters silently no-op. A job whose strategy never really ran
+    (no bars ever loaded) ends state "error" with a reason instead of a false "done" — check "error", not just
+    "state == done" plus a trade count. ALWAYS read "barsFrom"/"barsTo" (the bars really loaded) and
     "warnings": while a Playback connection is Connected NinjaTrader caps historical data at the replay clock,
-    so the run can cover a different window than from/to — the numbers are then for barsFrom..barsTo. A
-    fractional value for an integer input (Fast=5.5) is refused with 400, never rounded. Polls every POLL_S seconds; if still running after wait_s,
-    returns the last status doc with a note to call nt_backtest_status(id)."""
+    and with no data provider connected a short local window stays short instead of being filled on demand — the
+    warning names which; the numbers are then for barsFrom..barsTo, not from/to. "output" is the run's captured
+    Print() lines, or null with "outputNote" explaining why when it could not be captured (never a false []).
+    "equity" is always an array of {time, cumulativeNetProfit} per closed trade by exit time, uncapped by
+    max_trades, present even when include_trade_history=False; "sharpe" and "profitFactor" in "summary" are null
+    when there are fewer than 2 trades (not meaningful, whatever NinjaTrader itself reports). A fractional value
+    for an integer input (Fast=5.5) is refused with 400, never rounded. Polls every POLL_S seconds; if still
+    running after wait_s, returns the last status doc with a note to call nt_backtest_status(id). save_run=True
+    (default) saves every finished result to the run registry (nt_runs/nt_run/nt_run_compare); a save failure
+    adds a warning but never fails the backtest. nt_optimize/nt_walkforward pass save_run=False for their inner
+    runs so a sweep does not fill the registry with intermediate combos."""
     if not template:  # a template carries its own dates; never overwrite them with "the last 2 days"
         if not to_date:
             to_date = datetime.now().strftime("%Y-%m-%d")
@@ -120,6 +138,13 @@ def nt_backtest(
     if status.get("state") in ("queued", "running"):
         status = dict(status)
         status["note"] = f"still running; call nt_backtest_status({backtest_id!r})"
+        return status
+
+    if save_run and status.get("state") in ("done", "error", "timeout", "cancelled"):
+        saved = runs.save_run(body, status)
+        if "error" in saved:
+            status = dict(status)
+            status["warnings"] = list(status.get("warnings") or []) + [f"run not saved: {saved['error']}"]
     return status
 
 

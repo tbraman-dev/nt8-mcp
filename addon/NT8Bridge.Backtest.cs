@@ -39,8 +39,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 		private static Thread jobThread;
 		private static int jobCounter;
 		private static readonly TimeSpan JobCap = TimeSpan.FromMinutes(15);						// API.md: cap a run, then terminate it
-		private static readonly object outGate = new object();
-		private static List<string> outBuf;														// Print() capture for the running job
 
 		/// <summary>One queued or finished backtest. Written by the worker, read by HTTP threads: every field a
 		/// reader touches is volatile or only written before State leaves "running".</summary>
@@ -71,6 +69,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			public DateTime			QueuedAt, StartedAt, FinishedAt;
 			public DateTime			BarsFrom, BarsTo;			// first/last primary bar the run REALLY saw (MinValue = unknown)
 			public volatile string	WarningsJson = "[]";
+			public volatile string	EquityJson = "[]";			// {time, cumulativeNetProfit} per closed trade, by exit time — always an array, never null
+			public volatile string	OutputNoteJson = "null";	// null unless Backtest_CaptureOutput could not answer for `output` — see there
 			public string			ResultJson, Error;			// ResultJson = "summary":{..},"trades":[..],"output":[..]
 			public StrategyBase		Strat;						// live only while running, for the Terminated path; read/written only under jobGate
 			public bool				TearingDown;				// true from the moment the worker decides to unpublish Strat until the next publish; jobGate-guarded, same as Strat
@@ -426,6 +426,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 				Instrument inst = null;
 				try { inst = Instrument.GetInstrument(instName); } catch (Exception ex) { return Err(ref status, 400, "instrument '" + instName + "': " + ex.Message); }
 				if (inst == null) return Err(ref status, 400, "unknown instrument '" + instName + "'");
+				// A continuous-contract reference resolves (it is a real Instrument row) but RunBacktest() cannot
+				// use it: it has no concrete expiry to load bars against. Two tells, neither guessed — the
+				// "##-##" placeholder is NT8's own naming for one of these (addon/NOTES.md lesson 41), and a
+				// dated future always carries a real Expiry. "ES" and "ES ##-##" both resolve and both
+				// silently produce a 0-trade "done" — this check rejects it at request time, before anything
+				// is armed.
+				bool continuousStyle = instName.IndexOf("##", StringComparison.Ordinal) >= 0
+					|| (inst.MasterInstrument != null && inst.MasterInstrument.InstrumentType == InstrumentType.Future && inst.Expiry == DateTime.MinValue);
+				if (continuousStyle)
+					return Err(ref status, 400, "instrument '" + instName + "' is a continuous contract — NinjaTrader cannot backtest it; name a dated contract instead, e.g. '"
+						+ (inst.MasterInstrument != null ? inst.MasterInstrument.Name : instName) + " 12-26'");
 				job.Instrument = inst;
 				if (job.TradingHours == null) job.TradingHours = inst.MasterInstrument.TradingHours;
 			}
@@ -609,11 +620,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 			pairs.Add(P("inputs", job.InputsJson));
 			pairs.Add(job.State == "done" && job.ResultJson != null
 				? job.ResultJson
-				: P("summary", "null") + "," + P("trades", "null") + "," + P("output", "[]"));
+				// null, never a false []: a job that is not done has no output to report — see Backtest_CaptureOutput
+				: P("summary", "null") + "," + P("trades", "null") + "," + P("output", "null"));
 			pairs.Add(P("settings", job.SettingsJson));
 			pairs.Add(P("barsFrom", Tm(job.BarsFrom)));		// the window really loaded — `from`/`to` above are only the request
 			pairs.Add(P("barsTo", Tm(job.BarsTo)));
 			pairs.Add(P("warnings", job.WarningsJson));		// added after the frozen keys (NOTES.md "Status document v1")
+			pairs.Add(P("equity", job.EquityJson));			// {time, cumulativeNetProfit} per closed trade, by exit time — always an array
+			pairs.Add(P("outputNote", job.OutputNoteJson));	// non-null only when `output` above is null instead of a captured (possibly empty) array
 			return Obj(pairs.ToArray());
 		}
 
@@ -717,8 +731,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		private static void RunOne(Job job)
 		{
 			StrategyBase s = null;
-			lock (outGate) outBuf = new List<string>();
-			OutputHub.Register(OnOutput);		// the core owns the one OutputEvent subscription; this is a listener on it
+			long outCursor = OutputHub.Lines.Seen;		// cursor at job START, read to "now" at job end — never a listener of our own, the ring already is one
 			try
 			{
 				s = Configure(job);
@@ -746,11 +759,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 				}
 				if (job.Cancel || job.State != "running") return;
 				Backtest_Window(job, s);
-				job.ResultJson = Snapshot(job, s);
+				Backtest_VerifyRan(job, s);		// items 1 & 3: no bars ever loaded, or an impossible multi-series+High combo -> throw, never a silent "done"
+				job.ResultJson = Snapshot(job, s, outCursor);
 			}
 			finally
 			{
-				OutputHub.Unregister(OnOutput);
 				if (s != null)
 				{
 					lock (jobGate) { job.Strat = null; job.TearingDown = true; }		// same: clear + flag before TearDown so Terminate() can't race the finalize
@@ -778,14 +791,51 @@ namespace NinjaTrader.NinjaScript.AddOns
 			bool capped = clock.HasValue && job.To > clock.Value;
 			bool known = job.BarsFrom != DateTime.MinValue;
 			bool outside = known && (job.BarsTo < job.From || job.BarsFrom > job.To);
-			if (!capped && !outside) return;
-			string w = known
-				? "the numbers in this document are for the bars really loaded, " + job.BarsFrom.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture) + ".." + job.BarsTo.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture)
-					+ ", NOT for the requested from..to"
-				: "the loaded bar window is unknown and may not be the requested from..to";
-			if (clock.HasValue) w += ": a Connected Playback connection caps historical data at the replay clock " + clock.Value.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
-			job.WarningsJson = Arr(new[] { Q(w) });
-			Log(job.Id + " WARNING " + w);
+			bool shortWindow = known && (job.BarsFrom > job.From || job.BarsTo < job.To);		// a superset of `outside` — any coverage gap, not only a total miss
+			var warnings = new List<string>();
+			if (!capped && (outside || !known))
+			{
+				string w = known
+					? "the numbers in this document are for the bars really loaded, " + job.BarsFrom.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture) + ".." + job.BarsTo.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture)
+						+ ", NOT for the requested from..to"
+					: "the loaded bar window is unknown and may not be the requested from..to";
+				warnings.Add(w);
+			}
+			if (capped)
+			{
+				string w = "the numbers in this document are for the bars really loaded" + (known ? ", " + job.BarsFrom.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture) + ".." + job.BarsTo.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture) : "")
+					+ ", NOT for the requested from..to: a Connected Playback connection caps historical data at the replay clock " + clock.Value.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture);
+				warnings.Add(w);
+			}
+			// A short local window with no data provider connected is the single most useful thing to report here —
+			// the backtest engine (unlike /data/download) fetches missing bars from the connected provider on
+			// demand, so the fix is usually "connect one", not "wait".
+			if (shortWindow && !capped && !AnyNonSimConnected())
+				warnings.Add("connect a data provider: a backtest fetches missing bars from the connected provider on demand");
+			if (warnings.Count == 0) return;
+			job.WarningsJson = Arr(warnings.Select(Q));
+			foreach (var w in warnings) Log(job.Id + " WARNING " + w);
+		}
+
+		/// <summary>A job whose strategy never really ran must not report "done". Checked in this order because the
+		/// multi-series+High combination is ALWAYS impossible in NinjaTrader (Gui.Resource.resx — the same source
+		/// as the tickReplay+High refusal in BacktestStart) — when it applies, that is the one true reason,
+		/// regardless of what BarsFrom happens to read. Otherwise, no bars ever loaded is the general "never ran"
+		/// signal (0.04s "done", zero trades, barsFrom null); a standing NinjaTrader dialog, if one is up, is more
+		/// informative than the generic text and is marked as NinjaTrader's own words.</summary>
+		private static void Backtest_VerifyRan(Job job, StrategyBase s)
+		{
+			int seriesCount = 0;
+			try { seriesCount = s.BarsArray != null ? s.BarsArray.Length : 0; } catch { }
+			if (seriesCount > 1 && string.Equals(job.Settings.FillResolution, "High", StringComparison.OrdinalIgnoreCase))
+				throw new Exception("NinjaTrader: 'High' Order Fill Resolution is only available for single-series strategies. "
+					+ "For multi-series strategies, please program directly into your strategy the more granular resolution you would like to simulate order fills with.");
+			if (job.BarsFrom == DateTime.MinValue)
+			{
+				string modal = null;
+				try { modal = StandingModal(); } catch { }
+				throw new Exception(modal != null ? "NinjaTrader: " + modal : "the strategy never started / no bars loaded");
+			}
 		}
 
 		private static bool Ran(StrategyBase s) { return s.SystemPerformance != null || Cnt(s.Executions) > 0; }
@@ -939,40 +989,66 @@ namespace NinjaTrader.NinjaScript.AddOns
 			try { if (s.Id != 0) s.DbRemove(); } catch (Exception ex) { Log("teardown DbRemove: " + ex.Message); }
 		}
 
-		/// <summary>OutputHub listener, registered only while a job runs. Tab 2 is what Configure() points the strategy at.</summary>
-		private static void OnOutput(OutputHub.Line line)
+		/// <summary>The job's Print() output, read off the events module's
+		/// shared ring by CURSOR — never a listener of our own (NOTES.md "Module seams": OutputHub.Lines is a
+		/// core Ring&lt;OutputHub.Line&gt;, cap 20000; the cursor is a sequence number, taken at job start in RunOne
+		/// and read to "now" here). `note` is null on a clean capture (including a genuinely quiet run: `output`
+		/// is then `[]`, not null — an empty array is a true claim there). `output` itself comes back "null" (the
+		/// literal JSON token) instead of a false `[]` when the hub was never subscribed, or when the run printed
+		/// enough that the ring's 20000-line cap evicted some of it before this read.</summary>
+		private static string Backtest_CaptureOutput(long cursorStart, out string note)
 		{
-			if (line.Reset || line.Tab != 2) return;
-			lock (outGate) if (outBuf != null && outBuf.Count < 20000) outBuf.Add(line.Text);		// NT8's producer thread: never do I/O here (the hub swallows a throw)
+			if (!OutputHub.Subscribed) { note = "OutputHub is not subscribed to Print() events"; return "null"; }
+			long firstSeq, seenNow, dropped;
+			var window = OutputHub.Lines.Read(cursorStart, 0, out firstSeq, out seenNow, out dropped);		// max<=0 = no cap; the ring's own 20000 cap already bounds it
+			long expected = seenNow - cursorStart;
+			if (window.Count < expected)
+			{
+				note = "the output ring overflowed during this run — some Print() lines from it were evicted before they could be read";
+				return "null";
+			}
+			note = null;
+			return Arr(window.Where(ln => !ln.Reset && ln.Tab == 2).Select(ln => Q(ln.Text ?? "")));
 		}
 
 		private static int TCnt(TradeCollection c) { try { return c == null ? 0 : c.TradesCount; } catch { return 0; } }
 		private static double Avg(TradeCollection c) { try { return c == null ? double.NaN : c.TradesPerformance.Currency.AverageProfit; } catch { return double.NaN; } }
 
-		/// <summary>Results mapping (recipe §3), built BEFORE teardown: AllTrades may be gone after Finalized.</summary>
-		private static string Snapshot(Job job, StrategyBase s)
+		/// <summary>Results mapping (recipe §3), built BEFORE teardown: AllTrades may be gone after Finalized.
+		/// Also sets job.EquityJson and job.OutputNoteJson as a side effect — both are new keys
+		/// appended after the frozen ones (NOTES.md "Status document v1"), so they travel outside the returned
+		/// summary/trades/output blob rather than reordering it.</summary>
+		private static string Snapshot(Job job, StrategyBase s, long outCursor)
 		{
 			var perf = s.SystemPerformance ?? SystemPerformance.Calculate(s.Executions);
 			var all = perf.AllTrades;
 			var tp = all.TradesPerformance; var cur = tp.Currency;
 			int n = all.TradesCount, w = TCnt(all.WinningTrades), l = TCnt(all.LosingTrades);
+			// sharpe (reads 1 on a zero-trade run, 0 on a 348-trade one — not
+			// meaningful either way below 2 trades) and profitFactor (same shape: a ratio, not a sum) are
+			// forced null rather than trusting whatever NinjaTrader hands back for too few trades to define them.
+			bool meaningful = n >= 2;
 			string summary = Obj(
 				P("trades", I(n)), P("winners", I(w)), P("losers", I(l)), P("winRate", D(n == 0 ? 0 : (double)w / n)),
-				P("netProfit", D(tp.NetProfit)), P("grossProfit", D(tp.GrossProfit)), P("grossLoss", D(tp.GrossLoss)), P("profitFactor", D(tp.ProfitFactor)),
+				P("netProfit", D(tp.NetProfit)), P("grossProfit", D(tp.GrossProfit)), P("grossLoss", D(tp.GrossLoss)),
+				P("profitFactor", meaningful ? D(tp.ProfitFactor) : "null"),
 				P("commission", D(tp.TotalCommission)), P("maxDrawdown", D(cur.Drawdown)), P("avgTrade", D(cur.AverageProfit)),
 				P("avgWinner", D(Avg(all.WinningTrades))), P("avgLoser", D(Avg(all.LosingTrades))),
 				P("largestWinner", D(cur.LargestWinner)), P("largestLoser", D(cur.LargestLoser)), P("avgMae", D(cur.AverageMae)), P("avgMfe", D(cur.AverageMfe)),
-				P("avgBarsInTrade", D(tp.AverageBarsInTrade)), P("sharpe", D(tp.SharpeRatio)),
+				P("avgBarsInTrade", D(tp.AverageBarsInTrade)),
+				P("sharpe", meaningful ? D(tp.SharpeRatio) : "null"),
 				P("maxConsecWinners", I(tp.MaxConsecutiveWinner)), P("maxConsecLosers", I(tp.MaxConsecutiveLoser)));
 
 			var trades = new List<string>();
-			int cap = job.Settings.MaxTrades;		// maxTrades: trims trades[] ONLY — `summary` always counts every trade
+			var equityRows = new List<KeyValuePair<DateTime, double>>();
+			int cap = job.Settings.MaxTrades;		// maxTrades: trims trades[] ONLY — `summary` and `equity` always count every trade
 			foreach (Trade t in all)
 			{
-				if (cap > 0 && trades.Count >= cap) break;
 				try
 				{
 					var en = t.Entry; var ex = t.Exit;
+					if (ex != null) equityRows.Add(new KeyValuePair<DateTime, double>(ex.Time, t.ProfitCurrency));	// every CLOSED trade, uncapped — a maxTrades-trimmed curve would end on the wrong total
+					if (cap > 0 && trades.Count >= cap) continue;
 					int bars = en != null && ex != null ? ex.BarIndex - en.BarIndex : 0;
 					trades.Add(Obj(
 						P("n", I(t.TradeNumber)),
@@ -987,9 +1063,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 				}
 				catch (Exception e) { trades.Add(Obj(P("error", Q(e.Message)))); }
 			}
-			List<string> outp;
-			lock (outGate) { outp = outBuf ?? new List<string>(); outBuf = null; }
-			return P("summary", summary) + "," + P("trades", Arr(trades)) + "," + P("output", Arr(outp.Select(Q)));
+
+			equityRows.Sort((a, b) => a.Key.CompareTo(b.Key));		// BY EXIT TIME: TradeNumber order and exit order can differ once positions overlap
+			double cum = 0;
+			var equity = new List<string>(equityRows.Count);
+			foreach (var kv in equityRows) { cum += kv.Value; equity.Add(Obj(P("time", Tm(kv.Key)), P("cumulativeNetProfit", D(cum)))); }
+			job.EquityJson = Arr(equity);		// present even when includeTradeHistory=false empties `trades`: computed from the same AllTrades walk, so it is [] there too, never omitted
+
+			string outputNote;
+			string outputJson = Backtest_CaptureOutput(outCursor, out outputNote);
+			job.OutputNoteJson = outputNote == null ? "null" : Q(outputNote);
+			return P("summary", summary) + "," + P("trades", Arr(trades)) + "," + P("output", outputJson);
 		}
 	}
 }

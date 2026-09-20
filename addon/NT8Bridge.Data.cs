@@ -1,5 +1,7 @@
-// NT8Bridge.Data.cs — the data store: GET /data/coverage and the opt-in,
-// flag-gated POST /data/download + GET|DELETE /data/download/{id}.
+// NT8Bridge.Data.cs — the data store: GET /data/coverage, GET /data/probe, and
+// POST /data/download + GET|DELETE /data/download/{id}. A download moves no money, so none of
+// these need an arming file; they refuse only on real exposure (Data_Exposure) or with no real
+// data provider connected (AnyNonSimConnected).
 // Part of the NT8Bridge AddOn (core: NT8Bridge.cs; seams: addon/NOTES.md "Module seams").
 //
 // Portions of this file are derived from cli-nt-bridge
@@ -26,24 +28,28 @@ namespace NinjaTrader.NinjaScript.AddOns
 	public partial class NT8Bridge
 	{
 		// ── module constants ────────────────────────────────────────────────────
-		/// <summary>The arming file, beside the AddOn in bin\Custom\AddOns. Stat-checked on EVERY request and
-		/// IGNORED once its mtime is older than 24 h: that clause is the whole point — a flag forgotten after one
-		/// debugging session must not arm the module forever.</summary>
-		private const string Data_FlagName = "data.download.enabled";
-		private static readonly TimeSpan Data_FlagMaxAge = TimeSpan.FromHours(24);
 		private const int Data_MaxDays = 10;												// wider needs {"big":true}
 		private const int Data_MaxDaysBig = 400;		// a season; {"big":true} RAISES the cap, it never removes it
 		private static readonly TimeSpan Data_DateTimeout = TimeSpan.FromSeconds(900);		// a heavy MNQ replay day runs 300-460 s
 		private static readonly string[] Data_AllKinds = { "tick", "minute", "day", "replay" };
 		private static readonly string[] Data_AllTypes = { "Last", "Bid", "Ask" };
 
+		// ── /data/probe bounds: a few small requests, never an unbounded search ──
+		private const int Data_ProbeCapRequests = 14;					// log2(Data_ProbeCapDays) + slack
+		private static readonly TimeSpan Data_ProbeCapWall = TimeSpan.FromSeconds(90);
+		private static readonly TimeSpan Data_ProbeRequestTimeout = TimeSpan.FromSeconds(20);
+		private const int Data_ProbeCapDays = 3650;		// "at least N days back (search cap reached)" past this
+
 		// ── seams (NOTES.md "Module seams") ─────────────────────────────────────
-		/// <summary>GET /data/coverage, POST /data/download, GET|DELETE /data/download/{id}. Null for everything else —
-		/// including any other /data path, so the core emits the 404.</summary>
+		/// <summary>GET /data/coverage, GET /data/probe, GET /data/probe/{id}, POST /data/download,
+		/// GET|DELETE /data/download/{id}. Null for everything else — including any other /data path, so the
+		/// core emits the 404.</summary>
 		private static string Route_Data(string method, string[] seg, System.Collections.Specialized.NameValueCollection q, string body, ref int status)
 		{
 			if (seg.Length < 1 || seg[0] != "data") return null;
 			if (seg.Length == 2 && seg[1] == "coverage" && method == "GET")		return Data_Coverage(q, ref status);
+			if (seg.Length == 2 && seg[1] == "probe" && method == "GET")		return Data_ProbeStart(q, ref status);
+			if (seg.Length == 3 && seg[1] == "probe" && method == "GET")		return Data_ProbeStatus(seg[2], ref status);
 			if (seg.Length == 2 && seg[1] == "download" && method == "POST")	return Data_DownloadStart(body, ref status);
 			if (seg.Length == 3 && seg[1] == "download" && method == "GET")		return Data_DownloadStatus(seg[2], ref status);
 			if (seg.Length == 3 && seg[1] == "download" && method == "DELETE")	return Data_DownloadCancel(seg[2], ref status);
@@ -70,8 +76,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// the session closes, and NT8's session dates are ET whatever the machine's own zone is.
 			Compat.Resolve("TimeZoneInfo.EasternStandardTime", () => TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"));
 
-			Data_Flag();		// publishes Data.downloadFlag into /compat at start, before any request
-
 			// Its OWN worker, never the backtest one. Guarded because a rebind retry can run the
 			// start hooks a second time, and a second worker would double every download.
 			if (Data_thread == null || !Data_thread.IsAlive)
@@ -91,49 +95,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// still see it — otherwise a stranded worker plus a fresh one both dequeue, doubling every download.
 			try { if (Data_thread != null && Data_thread.Join(3000)) Data_thread = null; }
 			catch { Data_thread = null; }
-		}
-
-		// ── the arming flag ─────────────────────────────────────────────────────
-		private static string Data_FlagPath()
-		{
-			return Path.Combine(Core.Globals.UserDataDir, "bin", "Custom", "AddOns", Data_FlagName);
-		}
-
-		/// <summary>Stat the flag NOW — never cached, on every request. Returns true only when the file exists AND its
-		/// last write is inside 24 h. Also republishes the answer (and the flag's age) into GET /compat under
-		/// `Data.downloadFlag`; /compat is core-owned, so that row is as of the last check, not as of the /compat call.</summary>
-		private static bool Data_Flag()
-		{
-			bool armed = false;
-			double ageH = -1;
-			string detail;
-			try
-			{
-				string p = Data_FlagPath();
-				if (!File.Exists(p)) detail = "absent (" + Data_FlagName + ")";
-				else
-				{
-					ageH = (DateTime.UtcNow - File.GetLastWriteTimeUtc(p)).TotalHours;
-					// both sides: a future-dated flag would otherwise arm the gate for ever (same rule as Ops_Flag)
-					armed = ageH >= -5.0 / 3600 && ageH <= Data_FlagMaxAge.TotalHours;	// 5 s of clock skew
-					detail = (armed ? "armed, age " : ageH < 0 ? "IGNORED (mtime in the FUTURE), age " : "STALE (ignored), age ")
-						+ ageH.ToString("F2", CultureInfo.InvariantCulture) + " h of "
-						+ Data_FlagMaxAge.TotalHours.ToString("F0", CultureInfo.InvariantCulture) + " h";
-				}
-			}
-			catch (Exception ex) { detail = "stat failed: " + Deep(ex); armed = false; }
-			Compat.Set("Data.downloadFlag", armed, detail, null);
-			Data_flagAgeHours = ageH;
-			return armed;
-		}
-
-		private static double Data_flagAgeHours = -1;		// as of the last Data_Flag() call; -1 = absent / unreadable
-
-		private static string Data_FlagJson(bool armed)
-		{
-			return Obj(P("name", Q(Data_FlagName)), P("armed", armed ? "true" : "false"),
-				P("ageHours", Data_flagAgeHours < 0 ? "null" : D(Data_flagAgeHours)),
-				P("maxAgeHours", D(Data_FlagMaxAge.TotalHours)));
 		}
 
 		// ── /data/coverage ──────────────────────────────────────────────
@@ -249,6 +210,83 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return DateTime.TryParseExact(s, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out d);
 		}
 
+		/// <summary>"NQ 12-26" -> "NQ" (the chain a merge policy walks in a backtest). Bare symbols (no dated
+		/// contract) return the name itself, which still narrows the scan to an exact folder match below.</summary>
+		private static string Data_RootSymbol(string name)
+		{
+			var m = System.Text.RegularExpressions.Regex.Match(name ?? "", @"^(\S+) \d{2}-\d{2}$");
+			return m.Success ? m.Groups[1].Value : name;
+		}
+
+		/// <summary>What a BACKTEST can use without a provider: NT8's own bars cache
+		/// (db\cache\&lt;TradingHours&gt;.&lt;TimeZone&gt;\&lt;MINUTE|TICK&gt;\&lt;contract&gt;\&lt;seriesKey&gt;.&lt;from&gt;.&lt;to&gt;.&lt;Type&gt;.ncd —
+		/// see addon/NOTES.md "cache"), across every contract of the instrument's chain (root symbol match, same
+		/// idea as Data_ContinuousName). Name-based only, bounded (Data_CacheScanCap directories/files), never a
+		/// dispatcher or NinjaTrader call — same contract as Data_ScanStore. day/replay have no cache folder, so
+		/// only "minute"/"tick" are scanned; other kinds return an empty map.</summary>
+		private const int Data_CacheScanCap = 4000;
+		private static string Data_CacheJson(string name, string[] kinds)
+		{
+			string root = Data_RootSymbol(name);
+			string cacheRoot = Path.Combine(Core.Globals.UserDataDir, "db", "cache");
+			// seriesKey -> (contract, firstDay, lastDay); firstDay/lastDay are the "from"/"to" stems NT8 itself
+			// wrote into the filename, not re-derived from file content.
+			var series = new SortedDictionary<string, Tuple<string, string, string>>(StringComparer.Ordinal);
+			int scanned = 0;
+			bool capped = false;
+			try
+			{
+				if (Directory.Exists(cacheRoot))
+				{
+					foreach (var thDir in Directory.EnumerateDirectories(cacheRoot))
+					{
+						foreach (var k in kinds)
+						{
+							string kindFolder = k == "minute" ? "MINUTE" : k == "tick" ? "TICK" : null;
+							if (kindFolder == null) continue;
+							string kDir = Path.Combine(thDir, kindFolder);
+							if (!Directory.Exists(kDir)) continue;
+							foreach (var contractDir in Directory.EnumerateDirectories(kDir))
+							{
+								string contract = new DirectoryInfo(contractDir).Name;
+								if (!contract.StartsWith(root + " ", StringComparison.OrdinalIgnoreCase) && !string.Equals(contract, root, StringComparison.OrdinalIgnoreCase))
+									continue;
+								foreach (var f in Directory.EnumerateFiles(contractDir, "*.ncd"))
+								{
+									if (++scanned > Data_CacheScanCap) { capped = true; break; }
+									string stem = Path.GetFileNameWithoutExtension(f) ?? "";	// "<seriesKey>.<from8>.<to8>.<Type>"
+									var parts = stem.Split('.');
+									if (parts.Length < 4) continue;
+									string type = parts[parts.Length - 1], to = parts[parts.Length - 2], from = parts[parts.Length - 3];
+									string seriesKey = contract + "/" + string.Join(".", parts.Take(parts.Length - 3)) + "." + type;
+									Tuple<string, string, string> cur;
+									if (!series.TryGetValue(seriesKey, out cur))
+										series[seriesKey] = Tuple.Create(contract, from, to);
+									else
+									{
+										string lo = string.CompareOrdinal(from, cur.Item2) < 0 ? from : cur.Item2;
+										string hi = string.CompareOrdinal(to, cur.Item3) > 0 ? to : cur.Item3;
+										series[seriesKey] = Tuple.Create(contract, lo, hi);
+									}
+								}
+								if (capped) break;
+							}
+							if (capped) break;
+						}
+						if (capped) break;
+					}
+				}
+			}
+			catch (Exception ex) { Log("Data coverage cache scan: " + Deep(ex)); }
+
+			return Obj(
+				P("note", Q("what a backtest of that series can use without a provider (NT8's own bars cache, name-based scan)")),
+				P("scanned", Directory.Exists(cacheRoot) ? "true" : "false"),
+				P("capReached", capped ? "true" : "false"),
+				P("series", Obj(series.Select(kv => P(kv.Key, Obj(
+					P("contract", Q(kv.Value.Item1)), P("firstDay", Q(kv.Value.Item2)), P("lastDay", Q(kv.Value.Item3))))).ToArray())));
+		}
+
 		private static string Data_Coverage(System.Collections.Specialized.NameValueCollection q, ref int status)
 		{
 			string name = (q["instrument"] ?? "").Trim();
@@ -353,6 +391,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("to", Q(toS.Length > 0 ? toS : null)),
 				P("stores", Obj(stores.ToArray())),
 				P("alsoScanned", Obj(also.ToArray())),
+				P("cache", Data_CacheJson(name, kinds)),
 				P("missingWeekdays", missing),
 				P("daysLackingBidAsk", lacking),
 				P("thinDays", thin),
@@ -390,13 +429,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 			public readonly List<string> Failed = new List<string>();		// finished JSON objects
 		}
 
-		/// <summary>Validate on the HTTP thread, then queue and answer 202. Guard order is deliberate: the arming flag
-		/// first (an unarmed module tells you nothing about the machine), then the request, then the live predicates.</summary>
+		/// <summary>Validate on the HTTP thread, then queue and answer 202. No arming file: a download moves no
+		/// money. Guard order: the request first, then the live predicates (Data_Exposure, AnyNonSimConnected).</summary>
 		private static string Data_DownloadStart(string body, ref int status)
 		{
-			bool armed = Data_Flag();
-			if (!armed) return Err(ref status, 403, "data download not enabled");
-
 			Dictionary<string, object> req;
 			try { req = ParseJson(body) as Dictionary<string, object>; }
 			catch (Exception ex) { return Err(ref status, 400, "bad JSON body: " + ex.Message); }
@@ -464,7 +500,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 					+ ".." + job.To.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + " kinds=" + string.Join(",", kinds) + " types=" + string.Join(",", types));
 				status = 202;
 				return Obj(P("id", Q(job.Id)), P("state", Q("queued")), P("days", I(days)),
-					P("anyLive", AnyLiveConnected() ? "true" : "false"), P("anyNonSim", "true"), P("flag", Data_FlagJson(true)));
+					P("anyLive", AnyLiveConnected() ? "true" : "false"), P("anyNonSim", "true"));
 			}
 			catch (BadRequestException ex) { return Err(ref status, 400, ex.Message); }
 		}
@@ -525,7 +561,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 				dl = job.Downloaded.ToArray(); sk = job.Skipped.ToArray();
 				sc = job.SkippedCurrent.ToArray(); fa = job.Failed.ToArray();
 			}
-			bool armed = Data_Flag();		// stat-checked here too: a reader must see the flag go stale
 			long free = Data_FreeDiskBytes();
 			return Obj(
 				P("id", Q(job.Id)), P("state", Q(job.State)),
@@ -543,7 +578,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("skippedCurrent", Arr(sc.Select(Q))), P("failed", Arr(fa)),
 				P("anyLive", AnyLiveConnected() ? "true" : "false"),
 				P("anyNonSim", AnyNonSimConnected() ? "true" : "false"),
-				P("flag", Data_FlagJson(armed)),
 				P("freeDiskBytes", free < 0 ? "null" : I(free)));
 		}
 
@@ -633,14 +667,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			{
 				if (job.Cancel || !running) return;
 
-				// Every guard is re-checked per date, not once at POST time: a position can open, and the
-				// flag can go stale, in the minutes a multi-day job runs.
-				if (!Data_Flag())
-				{
-					job.Error = "arming flag " + Data_FlagName + " is absent or stale — stopped";
-					lock (Data_gate) if (job.State == "running") job.State = "error";
-					return;
-				}
+				// Every guard is re-checked per date, not once at POST time: a position can open in the
+				// minutes a multi-day job runs.
 				string exposure = Data_Exposure();
 				if (exposure != null)
 				{
@@ -762,13 +790,126 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return false;
 		}
 
+		/// <summary>The connection candidates for a tick/minute/day download, in the order a chart would try
+		/// them: connected real (non-Simulator/Playback) providers first, then Simulator/Playback connections,
+		/// ClientConnection (NT8's own hosted data service) LAST — the decompile spike (addon/NOTES.md /
+		/// docs/api/data.md) found no public API that asks NinjaTrader which connection serves an instrument's
+		/// historical data, so this is a best-effort order, not an authoritative one. `Data_HistDay` reports,
+		/// per day, exactly which candidate served it — never the order itself.</summary>
+		private static List<Connection> Data_HistCandidates()
+		{
+			var real = new List<Connection>();
+			var simPlayback = new List<Connection>();
+			foreach (var c in ConnSnapshot())
+			{
+				if (c == null || !IsConnected(c) || ReferenceEquals(c, Connection.ClientConnection)) continue;
+				(IsNonSim(c) ? real : simPlayback).Add(c);
+			}
+			var ordered = new List<Connection>(real);
+			ordered.AddRange(simPlayback);
+			try { if (Connection.ClientConnection != null && IsConnected(Connection.ClientConnection)) ordered.Add(Connection.ClientConnection); }
+			catch { }
+			return ordered;
+		}
+
+		/// <summary>Provider enum text + a generic ordinal label for a report, e.g. "connection 1 (Provider31,
+		/// Simulation)". The provider text and label are what may ever land in a repo file; the connection's own
+		/// NAME (here, at the end) is a runtime value on the user's own machine — never write it into source or docs.</summary>
+		private static string Data_ConnLabel(Connection c, int ordinal)
+		{
+			string provider = "unknown", name = null;
+			try { if (c != null && c.Options != null) { provider = c.Options.Provider.ToString(); name = c.Options.Name; } }
+			catch { }
+			return "connection " + ordinal + " (" + provider + (name == null ? "" : ", " + name) + ")";
+		}
+
 		private static void Data_HistDay(Data_Job job, string kind, DateTime day, string ds)
 		{
 			var wanted = job.Types.Where(t => job.Overwrite || !Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
 			if (wanted.Length == 0) { Data_Add(job.Skipped, ds + "/" + kind); return; }
 
 			var th = job.Instrument.MasterInstrument.TradingHours;
-			var coll = new Collection<Data.Bars>();
+			Func<Collection<Data.Bars>> freshColl = () =>
+			{
+				var c = new Collection<Data.Bars>();
+				foreach (var t in wanted)
+				{
+					var bp = new Data.BarsPeriod
+					{
+						BarsPeriodType	= Data_PeriodType(kind),
+						Value			= 1,
+						MarketDataType	= (Data.MarketDataType)Enum.Parse(typeof(Data.MarketDataType), t, true)
+					};
+					c.Add(new Data.Bars(job.Instrument, bp, day.Date, day.Date.AddDays(1).AddSeconds(-1), th));
+				}
+				return c;
+			};
+
+			var attempts = new List<string>();
+
+			// (a) DownloadFromProvider on each connected candidate — a fresh Bars collection per try, never the
+			// same instance handed to two connections. ClientConnection tried last: it has no entitlement when
+			// the real data comes from a broker adapter.
+			var candidates = Data_HistCandidates();
+			for (int i = 0; i < candidates.Count; i++)
+			{
+				string label = Data_ConnLabel(candidates[i], i + 1);
+				bool ok = false;
+				try
+				{
+					using (var done = new ManualResetEventSlim(false))
+					{
+						// showErrors:false matters — true plausibly raises a modal on the UI thread from this
+						// background job. This is exactly what the Historical Data window's Download button
+						// calls (HistoricalData.cs:442,539), just with the connection this module picked instead
+						// of a hardcoded ClientConnection.
+						Data.BarsSeries.DownloadFromProvider(freshColl(), job.Overwrite, false, null, candidates[i], false, false,
+							result => { ok = result; try { done.Set(); } catch { } });
+						if (!done.Wait(Data_DateTimeout))
+						{
+							attempts.Add(label + ": did not answer in "
+								+ Data_DateTimeout.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture) + "s");
+							continue;
+						}
+					}
+				}
+				catch (Exception ex) { attempts.Add(label + ": " + Deep(ex)); continue; }
+
+				if (!ok) { attempts.Add(label + ": download reported failure for " + string.Join(",", wanted)); continue; }
+
+				// Trust the store, not the callback: a "true" with nothing on disk is a silent gap later.
+				var written = wanted.Where(t => Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
+				if (written.Length == 0) { attempts.Add(label + ": reported success but wrote no .ncd for " + string.Join(",", wanted)); continue; }
+				Data_Add(job.Downloaded, ds + "/" + kind + " (" + string.Join(",", written) + ") via " + label);
+				return;
+			}
+
+			// (b) No candidate connection answered DownloadFromProvider. Fall back to the path a backtest
+			// already proves works: ask for the bars the way a chart does (Bars.GetBars, LookupPolicies.Provider
+			// | Repository) with NO connection argument — there is none on this API; NinjaTrader resolves it
+			// internally. We still trust only a coverage re-read afterward, never the callback alone.
+			string fbError;
+			if (Data_HistFallback(job, kind, day, wanted, out fbError))
+			{
+				var written = wanted.Where(t => Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
+				Data_Add(job.Downloaded, ds + "/" + kind + " (" + string.Join(",", written) + ") via fallback GetBars (connection chosen by NinjaTrader)");
+				return;
+			}
+			if (fbError != null) attempts.Add("fallback GetBars: " + fbError);
+
+			throw new Exception(kind + " download failed for " + string.Join(",", wanted) + " — "
+				+ (attempts.Count == 0 ? "no connected data connection available" : string.Join(" | ", attempts))
+				+ " — a backtest fetches missing bars on demand from the connected provider");
+		}
+
+		/// <summary>(b): Bars.GetBars per wanted type, no explicit connection (the public API has none — see
+		/// Data_HistCandidates). Returns true only once a coverage re-read confirms the day landed on disk;
+		/// "no error, nothing on disk" is reported as a failure, not a success (NinjaTrader may have served the
+		/// bars from memory without persisting them — this cannot be told apart from the callback alone).</summary>
+		private static bool Data_HistFallback(Data_Job job, string kind, DateTime day, string[] wanted, out string error)
+		{
+			error = null;
+			var th = job.Instrument.MasterInstrument.TradingHours;
 			foreach (var t in wanted)
 			{
 				var bp = new Data.BarsPeriod
@@ -777,26 +918,238 @@ namespace NinjaTrader.NinjaScript.AddOns
 					Value			= 1,
 					MarketDataType	= (Data.MarketDataType)Enum.Parse(typeof(Data.MarketDataType), t, true)
 				};
-				coll.Add(new Data.Bars(job.Instrument, bp, day.Date, day.Date.AddDays(1).AddSeconds(-1), th));
+				ErrorCode ec = ErrorCode.NoError;
+				string emsg = null;
+				using (var done = new ManualResetEventSlim(false))
+				{
+					Data.Bars.GetBars(job.Instrument, bp, day.Date, day.Date.AddDays(1).AddSeconds(-1), th,
+						false, false, false, false,
+						LookupPolicies.Provider | LookupPolicies.Repository, MergePolicy.DoNotMerge,
+						false, null, false, null,
+						(b, code, msg, state) => { ec = code; emsg = msg; try { done.Set(); } catch { } });
+					if (!done.Wait(Data_DateTimeout))
+					{
+						error = kind + "/" + t + ": did not answer in "
+							+ Data_DateTimeout.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture) + "s";
+						return false;
+					}
+				}
+				if (ec != ErrorCode.NoError)
+				{
+					error = kind + "/" + t + ": " + ec + (string.IsNullOrEmpty(emsg) ? "" : " " + emsg);
+					return false;
+				}
 			}
+			var written = wanted.Where(t => Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
+			if (written.Length == 0)
+			{
+				error = "no error, but wrote no .ncd for " + string.Join(",", wanted)
+					+ " — NinjaTrader may have served it from memory without persisting to disk";
+				return false;
+			}
+			return true;
+		}
 
-			bool ok = false;
+		// ── /data/probe: how far back the connected provider serves, by a bounded binary search ────
+		// The search itself (below, Data_ProbeRun) runs on its own one-shot background thread, never
+		// inline on the HttpListener thread pool that also serves every other endpoint — a slow or half-dead
+		// provider could otherwise pin a pool worker for up to Data_ProbeCapWall + Data_ProbeRequestTimeout
+		// (~110s). GET /data/probe answers 202 {id,state:"queued"} at once, same shape as /data/download;
+		// poll GET /data/probe/{id}.
+		private static readonly object Data_probeGate = new object();
+		private static readonly Dictionary<string, Data_ProbeJob> Data_probeJobs = new Dictionary<string, Data_ProbeJob>(StringComparer.OrdinalIgnoreCase);
+		private static int Data_probeCounter;
+
+		private sealed class Data_ProbeJob
+		{
+			public string			Id;
+			public volatile string	State = "queued";		// queued|running|done|error
+			public string			ResultJson;				// the finished response body, set once State != queued|running
+			public DateTime		QueuedAt = DateTime.Now, StartedAt, FinishedAt;
+		}
+
+		private static Data_ProbeJob Data_ProbeFind(string id) { lock (Data_probeGate) { Data_ProbeJob j; return Data_probeJobs.TryGetValue(id, out j) ? j : null; } }
+
+		/// <summary>Round back to the nearest weekday (probing a Saturday/Sunday only wastes the request cap —
+		/// there is no session on either day for any instrument this module covers).</summary>
+		private static DateTime Data_PrevWeekday(DateTime d)
+		{
+			d = d.Date;
+			while (d.DayOfWeek == DayOfWeek.Saturday || d.DayOfWeek == DayOfWeek.Sunday) d = d.AddDays(-1);
+			return d;
+		}
+
+		/// <summary>One small Bars.GetBars for a single day; null means "no answer within the per-request
+		/// timeout", which the caller must treat as inconclusive, never as "no data".</summary>
+		private static bool? Data_ProbeDay(Instrument inst, Data.BarsPeriodType bpType, Data.TradingHours th, DateTime day)
+		{
+			var bp = new Data.BarsPeriod { BarsPeriodType = bpType, Value = 1, MarketDataType = Data.MarketDataType.Last };
+			bool has = false, answered = false;
 			using (var done = new ManualResetEventSlim(false))
 			{
-				// showErrors:false matters — true plausibly raises a modal on the UI thread from this background job.
-				// This is exactly what the Historical Data window's Download button calls (HistoricalData.cs:442,539).
-				Data.BarsSeries.DownloadFromProvider(coll, job.Overwrite, false, null, Connection.ClientConnection, false, false,
-					result => { ok = result; try { done.Set(); } catch { } });
-				if (!done.Wait(Data_DateTimeout))
-					throw new TimeoutException(kind + " download did not answer in "
-						+ Data_DateTimeout.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture) + "s");
+				Data.Bars.GetBars(inst, bp, day.Date, day.Date.AddDays(1).AddSeconds(-1), th,
+					false, false, false, false,
+					LookupPolicies.Provider | LookupPolicies.Repository, MergePolicy.DoNotMerge,
+					false, null, false, null,
+					(b, code, msg, state) =>
+					{
+						answered = true;
+						try
+						{
+							// Count > 0 is not enough: NinjaTrader can answer with bars from OUTSIDE the asked day.
+							// Only a bar stamped inside the day (session end may fall on the next date) counts.
+							if (code == ErrorCode.NoError && b != null)
+								for (int i = 0; i < b.Count && !has; i++)
+								{
+									DateTime t = b.GetTime(i);
+									has = t >= day.Date && t < day.Date.AddDays(2);
+								}
+						}
+						catch { has = false; }
+						try { done.Set(); } catch { }
+					});
+				done.Wait(Data_ProbeRequestTimeout);
 			}
-			if (!ok) throw new Exception(kind + " download reported failure for " + string.Join(",", wanted));
+			return answered ? (bool?)has : null;
+		}
 
-			// Trust the store, not the callback: a "true" with nothing on disk is a silent gap later.
-			var written = wanted.Where(t => Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
-			if (written.Length == 0) throw new Exception(kind + " download reported success but wrote no .ncd for " + string.Join(",", wanted));
-			Data_Add(job.Downloaded, ds + "/" + kind + " (" + string.Join(",", written) + ")");
+		/// <summary>GET /data/probe: validates on the request thread and answers 202 {id,state:"queued"} at
+		/// once — the actual bounded binary search (never more than Data_ProbeCapRequests requests or
+		/// Data_ProbeCapWall wall time; a slow provider can still add up to Data_ProbeRequestTimeout per
+		/// request in flight) runs on its own one-shot background thread, never inline on the
+		/// HttpListener thread pool that also serves every other endpoint. Poll GET /data/probe/{id}, same
+		/// shape as /data/download. No arming file — a probe moves no money and writes at most a handful of
+		/// days into the local store as a side effect of Bars.GetBars, same as Data_HistFallback. Still
+		/// refuses on real exposure and without a real data provider connected, same as /data/download.</summary>
+		private static string Data_ProbeStart(System.Collections.Specialized.NameValueCollection q, ref int status)
+		{
+			string name = (q["instrument"] ?? "").Trim();
+			if (name.Length == 0) return Err(ref status, 400, "instrument is required, e.g. /data/probe?instrument=ES%2012-26&kind=minute");
+			string kind = (q["kind"] ?? "").Trim().ToLowerInvariant();
+			if (kind != "minute" && kind != "tick" && kind != "day")
+				return Err(ref status, 400, "kind must be one of minute|tick|day");
+
+			Instrument inst = null;
+			try { inst = Instrument.GetInstrument(name); } catch (Exception ex) { return Err(ref status, 400, "instrument '" + name + "': " + Deep(ex)); }
+			if (inst == null) return Err(ref status, 400, "unknown instrument '" + name + "'");
+
+			string exposure = Data_Exposure();
+			if (exposure != null)
+			{
+				status = 409;
+				return Obj(P("error", Q("data probe refused: " + exposure + " — flatten and cancel first")), P("exposure", "true"));
+			}
+			if (!AnyNonSimConnected())
+			{
+				status = 409;
+				return Obj(P("error", Q("data probe needs a real data provider connected (see /health.connections)")),
+					P("anyLive", AnyLiveConnected() ? "true" : "false"), P("anyNonSim", "false"));
+			}
+
+			var job = new Data_ProbeJob { Id = "p" + Interlocked.Increment(ref Data_probeCounter) };
+			lock (Data_probeGate) Data_probeJobs[job.Id] = job;
+			var t = new Thread(() => Data_ProbeRun(job, inst, name, kind)) { IsBackground = true, Name = "NT8Bridge-probe-" + job.Id };
+			t.Start();
+			status = 202;
+			return Obj(P("id", Q(job.Id)), P("state", Q("queued")));
+		}
+
+		private static string Data_ProbeStatus(string id, ref int status)
+		{
+			var job = Data_ProbeFind(id);
+			if (job == null) return Err(ref status, 404, "no data probe '" + id + "'");
+			if (job.State == "queued" || job.State == "running") return Obj(P("id", Q(job.Id)), P("state", Q(job.State)));
+			return job.ResultJson;
+		}
+
+		/// <summary>How far back the connected provider serves one instrument at one resolution, found with a
+		/// bounded binary search. Runs entirely on its own background thread (Data_ProbeStart above);
+		/// never throws out to it, an exception here becomes job.State == "error" instead of an unhandled
+		/// exception on a bare thread (which would take the whole NT8 process down).
+		/// ponytail: the "boundary is monotonic" assumption (once found, every later day also has data) is a
+		/// heuristic, not a guarantee — a provider with a genuine mid-history gap would report a boundary later
+		/// than the true earliest day. Upgrade to a full weekday scan if that is ever seen in practice.</summary>
+		private static void Data_ProbeRun(Data_ProbeJob job, Instrument inst, string name, string kind)
+		{
+			job.StartedAt = DateTime.Now;
+			job.State = "running";
+			try
+			{
+				var th = inst.MasterInstrument.TradingHours;
+				var bpType = Data_PeriodType(kind);
+				DateTime today = Data_TodayEt();
+				DateTime hi = Data_PrevWeekday(today.AddDays(-1));		// most recent testable (non-current, non-future) day
+				int requests = 0;
+				var sw = System.Diagnostics.Stopwatch.StartNew();
+
+				Func<DateTime, bool?> probe = d =>
+				{
+					if (requests >= Data_ProbeCapRequests || sw.Elapsed >= Data_ProbeCapWall) return null;
+					requests++;
+					return Data_ProbeDay(inst, bpType, th, d);
+				};
+
+				Func<int, bool, string, string> result = (used, capReached, note) => Obj(
+					P("id", Q(job.Id)), P("state", Q("done")),
+					P("instrument", Q(name)), P("instrumentResolved", Q(inst.FullName)), P("kind", Q(kind)),
+					P("requestsUsed", I(used)), P("capRequests", I(Data_ProbeCapRequests)), P("capReached", capReached ? "true" : "false"),
+					P("earliestDate", "null"), P("depthDays", "null"), P("note", Q(note)));
+
+				bool? atHi = probe(hi);
+				if (atHi == null)
+				{
+					job.ResultJson = result(requests, false, "no answer from the connected provider for "
+						+ hi.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + " within "
+						+ Data_ProbeRequestTimeout.TotalSeconds.ToString("F0", CultureInfo.InvariantCulture) + "s — cannot probe depth");
+				}
+				else if (atHi == false)
+				{
+					job.ResultJson = Obj(P("id", Q(job.Id)), P("state", Q("done")),
+						P("instrument", Q(name)), P("instrumentResolved", Q(inst.FullName)), P("kind", Q(kind)),
+						P("requestsUsed", I(requests)), P("capRequests", I(Data_ProbeCapRequests)), P("capReached", "false"),
+						P("earliestDate", "null"), P("depthDays", I(0)),
+						P("note", Q("no " + kind + " data from the connected provider even for " + hi.ToString("yyyyMMdd", CultureInfo.InvariantCulture))));
+				}
+				else
+				{
+					DateTime lo = Data_PrevWeekday(hi.AddDays(-Data_ProbeCapDays));
+					bool? atLo = probe(lo);
+					if (atLo == true)
+					{
+						job.ResultJson = result(requests, true, "at least " + Data_ProbeCapDays + " days back (search cap reached) — the connected provider may serve more");
+					}
+					else
+					{
+						DateTime good = hi, bad = lo;		// good: known to have data; bad: no data OR no answer, treated as the floor
+						while (requests < Data_ProbeCapRequests && sw.Elapsed < Data_ProbeCapWall)
+						{
+							int spanDays = (int)(good - bad).TotalDays;
+							if (spanDays <= 1) break;
+							DateTime mid = Data_PrevWeekday(bad.AddDays(spanDays / 2));
+							if (mid <= bad || mid >= good) break;
+							bool? has = probe(mid);
+							if (has == null) break;			// no answer — stop, report what is known so far
+							if (has == true) good = mid; else bad = mid;
+						}
+						bool capHit = requests >= Data_ProbeCapRequests || sw.Elapsed >= Data_ProbeCapWall;
+						int depthDays = (int)(today.Date - good.Date).TotalDays;
+						job.ResultJson = Obj(P("id", Q(job.Id)), P("state", Q("done")),
+							P("instrument", Q(name)), P("instrumentResolved", Q(inst.FullName)), P("kind", Q(kind)),
+							P("requestsUsed", I(requests)), P("capRequests", I(Data_ProbeCapRequests)), P("capReached", "false"),
+							P("earliestDate", Q(good.ToString("yyyyMMdd", CultureInfo.InvariantCulture))), P("depthDays", I(depthDays)),
+							P("note", Q(capHit
+								? "search stopped at its request/time cap before narrowing further — depth is approximate, no earlier than this date"
+								: "binary search over Bars.GetBars; NinjaTrader resolves the connection itself")));
+					}
+				}
+				job.State = "done";
+			}
+			catch (Exception ex)
+			{
+				job.ResultJson = Obj(P("id", Q(job.Id)), P("state", Q("error")), P("error", Q(Deep(ex))));
+				job.State = "error";
+			}
+			finally { job.FinishedAt = DateTime.Now; }
 		}
 	}
 }

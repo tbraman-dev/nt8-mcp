@@ -121,6 +121,69 @@ null. `StrategyTemplate` is a public static class in `NinjaTrader.Gui`, which
 `NinjaTrader.Custom.csproj` already references, so both calls are typed — there is no reflection in
 this module and therefore nothing for `GET /compat` to report.
 
+## Truthfulness fixes
+
+A job whose strategy never really ran must never report `state:"done"`. Four cases, all observed
+on NinjaTrader 8.1.8.2 and all fixed at the boundary this repo controls:
+
+1. **No bars ever loaded.** If `barsFrom` would still be `null` when the run finishes, the job
+   ends `state:"error"` instead of `"done"`. `error` is NinjaTrader's own standing-dialog text when
+   one is up (prefixed `"NinjaTrader: "`), else `"the strategy never started / no bars loaded"`.
+2. **Multi-series + `fillResolution:"High"`.** NinjaTrader itself refuses this combination — "'High'
+   Order Fill Resolution is only available for single-series strategies. For multi-series
+   strategies, please program directly into your strategy the more granular resolution you would
+   like to simulate order fills with." — but only shows a modal and returns a fast, empty
+   `SystemPerformance` instead of raising. Detected once `BarsArray.Length > 1` is known (after
+   `Configure`), and the job ends `state:"error"` with NinjaTrader's own sentence, whether or not
+   `barsFrom` also came back null.
+3. **An unresolvable or continuous-contract instrument.** `instrument` is resolved before the job is
+   queued. Unknown name → `400 {"error":"unknown instrument '<name>'"}`. A name that resolves but is
+   a continuous-contract reference (no dated expiry — `"ES"`, `"ES ##-##"`) → `400` naming a dated
+   contract to use instead. `nt_data_coverage` can still list a continuous name as locally
+   "resolved" — that answers a different question (what data exists on disk), not whether a
+   backtest can use it.
+4. **`output` was `[]` even when Print() output existed** (it does exist, in the events module's
+   ring — see below).
+
+## `output` / `outputNote` (key 16 nullability, plus one new key)
+
+`output` is captured by **cursor**, off the same ring `GET /output` reads (`addon/NOTES.md` "Module
+seams" — `OutputHub.Lines`, a `Ring<OutputHub.Line>` capped at 20000, owned by the core): the
+sequence number is taken when the job starts running and read to "now" when it finishes, filtered to
+tab 2 (`PrintTo = OutputTab2`, set in `Configure()`). This replaced an earlier per-job listener that
+worked but duplicated what the ring already does.
+
+`output` is `null` — never a false `[]` — when it could not be captured: the hub was never
+subscribed, or the run printed enough that the ring's cap evicted some of it before this read. A
+genuinely quiet run still reports `output:[]`; that is a true claim there. The new key `outputNote`
+(string, nullable, always present) explains a `null` `output`; it is `null` whenever `output` is a
+real array.
+
+## `equity` (new key)
+
+An array of `{time, cumulativeNetProfit}`, one entry per **closed** trade, ordered by **exit time**
+(not `n`/`TradeNumber` — those can differ once positions overlap). Always present as an array
+(`[]` when there are no closed trades), and **not** trimmed by `maxTrades` — trimming would leave
+the curve ending on the wrong total. When `includeTradeHistory:false` empties `trades[]`, `equity`
+is `[]` too: NinjaTrader keeps the summary numbers but drops the per-trade objects this is computed
+from, so there is nothing to build a curve from.
+
+## `summary.sharpe` / `summary.profitFactor` are `null` below 2 trades
+
+`sharpe` reads `1` on a zero-trade run and `0` on a 348-trade run — not a meaningful
+number either way with fewer than 2 trades to define a ratio over. Both `sharpe` and `profitFactor`
+are now forced `null` when `summary.trades < 2`, regardless of what NinjaTrader itself returns for
+that case.
+
+## `warnings`: "connect a data provider"
+
+When the loaded window is shorter than the request (`barsFrom > from` or `barsTo < to`) for a
+reason **other** than a Connected Playback connection capping the clock, and no data provider is
+connected (`AnyNonSimConnected()` false), `warnings` includes: `"connect a data provider: a
+backtest fetches missing bars from the connected provider on demand"`. A backtest fetches missing
+bars from whichever adapter is connected; `/data/download` cannot (see `docs/api/data.md`), so this
+is the actionable fix, not "wait" or "download".
+
 ## Status document — the new `settings` key
 
 `GET /backtest/{id}` returns the 16 keys frozen in `addon/NOTES.md` "Status document v1", unchanged,
@@ -185,7 +248,7 @@ input and the value. `5.0` is accepted and runs as `5`. Before this, `5.5` ran a
 | Tool | Maps to |
 |---|---|
 | `nt_templates(strategy)` | `GET /templates?strategy=` |
-| `nt_backtest(strategy, …, template, fill_resolution, fill_resolution_type, fill_resolution_value, slippage_ticks, commission_template, include_commission, fill_limit_on_touch, include_trade_history, max_trades)` | `POST /backtest` + poll |
+| `nt_backtest(strategy, …, template, fill_resolution, fill_resolution_type, fill_resolution_value, slippage_ticks, commission_template, include_commission, fill_limit_on_touch, include_trade_history, max_trades, save_run)` | `POST /backtest` + poll, then the run registry |
 | `nt_backtest_status(id)` / `nt_backtests()` / `nt_backtest_cancel(id)` / `nt_strategies()` | unchanged |
 
 `nt_backtest` sends a settings field **only when the caller passed it**, so an absent argument keeps
@@ -195,3 +258,13 @@ is what keeps "not asked for" apart from an explicit `0.0` / `False`. With `temp
 not default the dates to the last two days and does not send `chart="first"` — the template's own
 dates, instrument and bar period are the point of passing one — but any argument the caller states
 explicitly is still sent and still wins.
+
+## Run registry (`save_run`)
+
+`nt_backtest(..., save_run=True)` (the default) saves every result that reaches a terminal state
+(`done`, `error`, `timeout` or `cancelled`) to the run registry — see `docs/api/runs.md` for
+`nt_runs` / `nt_run` / `nt_run_compare`, and `server/nt8_mcp/runs.py` for the writer. A save failure
+never fails the backtest: it appends `"run not saved: <reason>"` to the result's `warnings` instead.
+`nt_optimize` / `nt_walkforward` call their inner `nt_backtest`s with `save_run=False` so a sweep of
+disposable combos does not fill the registry — only the swept, ranked result belongs there, and that
+is each module's own choice, not this one's.

@@ -8,7 +8,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [_HERE, os.path.join(_HERE, "..")]
 
 from fake_addon import FakeAddon  # noqa: E402
-from nt8_mcp import app, server as nt8  # noqa: E402
+from nt8_mcp import app, runs, server as nt8  # noqa: E402
 
 STRATEGIES = [
     {"name": "SampleMACrossOver", "fullName": "NinjaTrader.NinjaScript.Strategies.SampleMACrossOver",
@@ -208,3 +208,85 @@ def test_nt_backtest_without_template_still_sends_chart_and_dates():
         nt8.nt_backtest("SampleMACrossOver")
     assert seen["chart"] == "first"
     assert len(seen["from"]) == 10 and len(seen["to"]) == 10, seen
+
+
+# ── run registry (save_run) ─────────────────────────────────────────────────
+# runs.save_run itself is exercised against the real filesystem in test_runs.py; here the point is
+# only that nt_backtest calls it (or doesn't) with the right request/result and handles its outcome.
+
+def _patch_save_run(fn):
+    saved = runs.save_run
+    runs.save_run = fn
+    return saved
+
+
+def test_nt_backtest_saves_a_finished_run_by_default():
+    calls = []
+    saved = _patch_save_run(lambda request, result: (calls.append((request, result)), {"id": "x"})[1])
+    try:
+        with FakeAddon() as fake:
+            fake.json("/backtest", {"id": "b1", "state": "queued"}, method="POST", status=202)
+            fake.json("/backtest/b1", {"id": "b1", "state": "done", "summary": {"trades": 1}})
+            nt8.nt_backtest("SampleMACrossOver", from_date="2026-09-15", to_date="2026-09-17")
+    finally:
+        runs.save_run = saved
+    assert len(calls) == 1, calls
+    request, result = calls[0]
+    assert request["strategy"] == "SampleMACrossOver"
+    assert result["state"] == "done"
+
+
+def test_nt_backtest_save_run_false_skips_the_registry():
+    calls = []
+    saved = _patch_save_run(lambda request, result: calls.append(1) or {"id": "x"})
+    try:
+        with FakeAddon() as fake:
+            fake.json("/backtest", {"id": "b1", "state": "queued"}, method="POST", status=202)
+            fake.json("/backtest/b1", {"id": "b1", "state": "done", "summary": {"trades": 1}})
+            nt8.nt_backtest("SampleMACrossOver", save_run=False)
+    finally:
+        runs.save_run = saved
+    assert calls == []
+
+
+def test_nt_backtest_still_running_never_saves():
+    calls = []
+    saved = _patch_save_run(lambda request, result: calls.append(1) or {"id": "x"})
+    saved_poll = app.POLL_S
+    app.POLL_S = 0
+    try:
+        with FakeAddon() as fake:
+            _backtest_fake(fake, polls_until_done=10_000)
+            nt8.nt_backtest("SampleMACrossOver", wait_s=0)
+    finally:
+        runs.save_run = saved
+        app.POLL_S = saved_poll
+    assert calls == []
+
+
+def test_nt_backtest_a_save_failure_adds_a_warning_and_still_returns_the_result():
+    saved = _patch_save_run(lambda request, result: {"error": "disk full"})
+    try:
+        with FakeAddon() as fake:
+            fake.json("/backtest", {"id": "b1", "state": "queued"}, method="POST", status=202)
+            fake.json("/backtest/b1", {"id": "b1", "state": "done", "summary": {"trades": 1}, "warnings": ["existing"]})
+            result = nt8.nt_backtest("SampleMACrossOver")
+    finally:
+        runs.save_run = saved
+    assert result["state"] == "done"  # a save failure is a warning, never a failed backtest
+    assert "existing" in result["warnings"]
+    assert any("disk full" in w for w in result["warnings"]), result["warnings"]
+
+
+def test_nt_backtest_error_state_still_saves():
+    # an "error" job is exactly the run history worth keeping.
+    calls = []
+    saved = _patch_save_run(lambda request, result: calls.append(result["state"]) or {"id": "x"})
+    try:
+        with FakeAddon() as fake:
+            fake.json("/backtest", {"id": "b1", "state": "queued"}, method="POST", status=202)
+            fake.json("/backtest/b1", {"id": "b1", "state": "error", "error": "the strategy never started / no bars loaded"})
+            nt8.nt_backtest("SampleMACrossOver")
+    finally:
+        runs.save_run = saved
+    assert calls == ["error"]

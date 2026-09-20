@@ -133,6 +133,110 @@ def test_nt_compat():
     assert compat["members"][0]["resolved"] is True
 
 
+def _iso(epoch):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_nt_status_disagreement_true_when_addon_claims_current_but_disk_is_newer():
+    import tempfile
+    import time
+    from nt8_mcp import app, tools_local
+
+    with tempfile.TemporaryDirectory() as custom, tempfile.TemporaryDirectory() as empty_addon_dir:
+        built = time.time() - 3600  # the AddOn's assembly was built an hour ago
+        cs = os.path.join(custom, "Strategies", "Foo.cs")
+        os.makedirs(os.path.dirname(cs))
+        with open(cs, "w") as fh:
+            fh.write("// newer than the running assembly")
+        os.utime(cs, (time.time(), time.time()))  # freshly "edited" .cs, i.e. right now
+
+        saved_custom, saved_addon_dir = app.NT_CUSTOM, tools_local.ADDON_DIR
+        app.NT_CUSTOM, tools_local.ADDON_DIR = custom, __import__("pathlib").Path(empty_addon_dir)
+        try:
+            with FakeAddon() as fake:
+                fake.json("/ntstatus", {"verdict": "current", "runningAssembly": "x"})
+                fake.json("/health", {"assemblyBuiltUtc": _iso(built)})
+                status = nt8.nt_status()
+        finally:
+            app.NT_CUSTOM, tools_local.ADDON_DIR = saved_custom, saved_addon_dir
+
+    assert status["diskCheck"]["diskNewerThanAddon"] is True, status
+    assert status["disagreement"] is True, status
+
+
+def test_nt_status_no_disagreement_when_disk_is_not_newer():
+    import tempfile
+    import time
+    from nt8_mcp import app, tools_local
+
+    with tempfile.TemporaryDirectory() as custom, tempfile.TemporaryDirectory() as empty_addon_dir:
+        cs = os.path.join(custom, "Strategies", "Foo.cs")
+        os.makedirs(os.path.dirname(cs))
+        with open(cs, "w") as fh:
+            fh.write("// old, already-compiled code")
+        old = time.time() - 7200
+        os.utime(cs, (old, old))
+        built = time.time() - 60  # the assembly was built AFTER this .cs was last touched
+
+        saved_custom, saved_addon_dir = app.NT_CUSTOM, tools_local.ADDON_DIR
+        app.NT_CUSTOM, tools_local.ADDON_DIR = custom, __import__("pathlib").Path(empty_addon_dir)
+        try:
+            with FakeAddon() as fake:
+                fake.json("/ntstatus", {"verdict": "current"})
+                fake.json("/health", {"assemblyBuiltUtc": _iso(built)})
+                status = nt8.nt_status()
+        finally:
+            app.NT_CUSTOM, tools_local.ADDON_DIR = saved_custom, saved_addon_dir
+
+    assert status["diskCheck"]["diskNewerThanAddon"] is False, status
+    assert status["disagreement"] is False, status
+
+
+def test_nt_status_installed_vs_repo_flags_a_byte_difference_and_a_missing_install():
+    import tempfile
+    from pathlib import Path
+
+    from nt8_mcp import app, tools_local
+
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as custom:
+        repo_dir = Path(repo)
+        (repo_dir / "NT8Bridge.cs").write_text("// core v2")
+        (repo_dir / "NT8Bridge.Api.cs").write_text("// api module")
+        addons_dir = Path(custom) / "AddOns"
+        addons_dir.mkdir(parents=True)
+        (addons_dir / "NT8Bridge.cs").write_text("// core v1 (stale install)")
+        # NT8Bridge.Api.cs deliberately not installed
+
+        saved_custom, saved_addon_dir = app.NT_CUSTOM, tools_local.ADDON_DIR
+        app.NT_CUSTOM, tools_local.ADDON_DIR = custom, repo_dir
+        try:
+            with FakeAddon() as fake:
+                fake.json("/ntstatus", {"verdict": "unknown"})
+                fake.json("/health", {})
+                status = nt8.nt_status()
+        finally:
+            app.NT_CUSTOM, tools_local.ADDON_DIR = saved_custom, saved_addon_dir
+
+    diff = status["installedVsRepo"]
+    assert diff["differs"] == ["NT8Bridge.Api.cs (not installed)", "NT8Bridge.cs"], diff
+
+
+def test_nt_status_installed_vs_repo_none_when_repo_not_found():
+    from nt8_mcp import tools_local
+
+    saved = tools_local.ADDON_DIR
+    tools_local.ADDON_DIR = __import__("pathlib").Path("Z:\\definitely\\not\\a\\real\\repo")
+    try:
+        with FakeAddon() as fake:
+            fake.json("/ntstatus", {"verdict": "unknown"})
+            fake.json("/health", {})
+            status = nt8.nt_status()
+    finally:
+        tools_local.ADDON_DIR = saved
+    assert status["installedVsRepo"] is None, status
+
+
 def test_nt_screenshot_returns_image():
     import tempfile
     path = os.path.join(tempfile.gettempdir(), "nt8_fake_shot.png")

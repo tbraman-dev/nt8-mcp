@@ -116,16 +116,25 @@ def test_optimize_ranks_best_first_and_returns_the_winner_doc():
         _grid_fake(fake, lambda body: _doc(f"b{body['inputs']['Fast']}", nets[body["inputs"]["Fast"]]), seen)
         result = nt8.nt_optimize("SampleMACrossOver", {"Fast": {"min": 5, "max": 15, "step": 5}},
                                  instrument="ES 12-26", bars_period={"type": "Minute", "value": 5},
-                                 from_date="2026-09-10", to_date="2026-09-17")
+                                 from_date="2026-09-10", to_date="2026-09-17", include_trades=True)
     assert result["combos"] == 3 and result["ran"] == 3, result
     assert [r["inputs"]["Fast"] for r in result["rows"]] == [10, 15, 5], result["rows"]
     assert [r["rank"] for r in result["rows"]] == [1, 2, 3]
     assert result["rows"][0]["fitness"] == 300.0
-    assert result["best"]["id"] == "b10" and result["best"]["trades"], "the winner keeps its trades[]"
+    assert result["best"]["id"] == "b10" and result["best"]["trades"], "include_trades=True keeps best's trades[]"
     assert "trades" not in result["rows"][0], "ranked rows carry summary only, never trades[]"
     # every combination really went to the AddOn, with the grid value in inputs
     assert sorted(b["inputs"]["Fast"] for b in seen) == [5, 10, 15]
     assert seen[0]["from"] == "2026-09-10" and seen[0]["tickReplay"] is False
+
+
+def test_optimize_hides_best_trades_by_default():
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 100.0))
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5]},
+                                 from_date="2026-09-10", to_date="2026-09-17")
+    assert result["best"]["trades"] is None, "include_trades defaults to False"
+    assert result["best"]["id"] == "b1", "stripping trades must not lose the rest of the winner doc"
 
 
 def test_optimize_fitness_key_and_min_drawdown_direction():
@@ -227,6 +236,74 @@ def test_optimize_a_dropped_poll_keeps_the_job_id_instead_of_looking_refused():
     assert "not reachable" in row["skipped"]
 
 
+# -- cost pass-through & truthfulness ------
+
+def test_optimize_passes_costs_through_to_every_inner_backtest():
+    seen = []
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 1.0), seen)
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5]}, from_date="2026-09-10", to_date="2026-09-17",
+                                 slippage_ticks=1, commission_template="Default", include_commission=True,
+                                 fill_resolution="High", fill_resolution_type="Tick", fill_resolution_value=1,
+                                 fill_limit_on_touch=True)
+    body = seen[0]
+    assert body["slippageTicks"] == 1 and body["commissionTemplate"] == "Default"
+    assert body["includeCommission"] is True and body["fillLimitOnTouch"] is True
+    assert body["fillResolution"] == "High" and body["fillResolutionType"] == "Tick" and body["fillResolutionValue"] == 1
+    assert result["costs"] == {"slippageTicks": 1, "commissionTemplate": "Default", "includeCommission": True,
+                               "fillResolution": "High", "fillResolutionType": "Tick", "fillResolutionValue": 1,
+                               "fillLimitOnTouch": True}
+
+
+def test_optimize_costs_says_gross_when_nothing_was_set():
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 1.0))
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5]}, from_date="2026-09-10", to_date="2026-09-17")
+    assert result["costs"]["note"] == "gross: no slippage or commission modelled"
+    assert all(v is None for k, v in result["costs"].items() if k != "note")
+
+
+def test_optimize_never_sends_a_save_run_body_key():
+    # An inner combo posts straight to the AddOn's /backtest, never through
+    # tools_backtest.nt_backtest() — the only place that ever calls runs.save_run() — so
+    # there is nothing for a "saveRun" body key to do; the AddOn's BacktestStart has no such
+    # field either. The protection against a grid filling the run registry already comes
+    # for free from not calling nt_backtest(), not from a JSON key.
+    seen = []
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 1.0), seen)
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5]}, from_date="2026-09-10", to_date="2026-09-17")
+    assert result["ran"] == 1
+    assert "saveRun" not in seen[0], seen[0]
+
+
+def test_optimize_never_ranks_a_job_that_never_ran_as_zero_profit():
+    # state "done", trades 0, netProfit 0, but barsFrom null — the
+    # strategy never started (a modal, a refused fill mode, an unresolved instrument).
+    with FakeAddon() as fake:
+        def handler(body):
+            if body["inputs"]["Fast"] == 5:
+                doc = _doc("b5", 0.0, trades=0)
+                doc["barsFrom"] = None
+                return doc
+            return _doc("b10", 10.0)
+        _grid_fake(fake, lambda body: handler(body))
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5, 10]}, min_trades=0,
+                                 from_date="2026-09-10", to_date="2026-09-17")
+    assert result["best"]["id"] == "b10", "the never-ran zero-profit row must not win"
+    never_ran = [r for r in result["rows"] if r["id"] == "b5"][0]
+    assert never_ran["skipped"] and "barsFrom is null" in never_ran["skipped"]
+    assert any(e["id"] == "b5" for e in result["errors"])
+
+
+def test_optimize_a_doc_with_no_barsfrom_key_is_unaffected():
+    # a nt_backtest build that predates barsFrom must not be misread as "never ran".
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 50.0))
+        result = nt8.nt_optimize("SampleMACrossOver", {"Fast": [5]}, from_date="2026-09-10", to_date="2026-09-17")
+    assert result["best"]["id"] == "b1" and not result["errors"]
+
+
 # -- nt_walkforward ---------------------------------------------------------
 
 def test_walkforward_slices_windows_and_stitches_oos_trades():
@@ -235,7 +312,7 @@ def test_walkforward_slices_windows_and_stitches_oos_trades():
     with FakeAddon() as fake:
         _grid_fake(fake, lambda body: _doc("b1", nets[body["inputs"]["Fast"]], n_trades=2), seen)
         result = nt8.nt_walkforward("SampleMACrossOver", {"Fast": [5, 10]}, train_days=10, test_days=5,
-                                    from_date="2026-01-01", to_date="2026-01-20")
+                                    from_date="2026-01-01", to_date="2026-01-20", include_trades=True)
     assert len(result["windows"]) == 2, result["windows"]
     w1, w2 = result["windows"]
     assert w1["inSample"] == {"from": "2026-01-01", "to": "2026-01-10", "inputs": {"Fast": 10},
@@ -251,6 +328,61 @@ def test_walkforward_slices_windows_and_stitches_oos_trades():
     assert [t["window"] for t in stitched["trades"]] == [1, 1, 2, 2]
     assert stitched["summary"]["netProfit"] == 600.0
     assert "Not a NinjaTrader performance summary" in stitched["note"]
+    # the compact table always ships, one row per window, no trades in it at all
+    assert len(result["table"]) == 2
+    assert result["table"][0] == {"window": 1, "inSample": {"from": "2026-01-01", "to": "2026-01-10"},
+                                  "outOfSample": {"from": "2026-01-11", "to": "2026-01-15"},
+                                  "inputs": {"Fast": 10}, "inSampleFitness": 300.0,
+                                  "outOfSampleNetProfit": 300.0, "outOfSampleTrades": 10,
+                                  "state": "done", "error": None}
+
+
+def test_walkforward_hides_stitched_trades_by_default():
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 100.0, n_trades=2))
+        result = nt8.nt_walkforward("SampleMACrossOver", {"Fast": [5]}, train_days=10, test_days=5,
+                                    from_date="2026-01-01", to_date="2026-01-20")
+    assert result["outOfSample"]["trades"] == [], "include_trades defaults to False"
+    assert result["outOfSample"]["summary"]["netProfit"] == 200.0, "the summed summary is unaffected"
+
+
+def test_walkforward_table_row_is_an_error_when_the_oos_run_never_started():
+    # in-sample optimizes fine, but the winning combo's out-of-sample run comes back
+    # "done" with barsFrom null — never rank that as a real zero-profit out-of-sample result.
+    with FakeAddon() as fake:
+        def handler(body):
+            oos = body["from"] == "2026-01-11"
+            doc = _doc("b1", 0.0 if oos else 100.0, trades=0 if oos else 10)
+            if oos:
+                doc["barsFrom"] = None
+            return doc
+        _grid_fake(fake, handler)
+        result = nt8.nt_walkforward("SampleMACrossOver", {"Fast": [5]}, train_days=10, test_days=5,
+                                    from_date="2026-01-01", to_date="2026-01-15")
+    row = result["table"][0]
+    assert row["state"] == "error" and row["outOfSampleNetProfit"] is None and row["outOfSampleTrades"] is None
+    assert "barsFrom is null" in row["error"]
+    assert result["outOfSample"]["windows"] == 0, "a never-ran oos run must not be stitched in either"
+
+
+def test_walkforward_table_row_is_skipped_when_no_in_sample_combo_qualifies():
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 1.0, trades=0))
+        result = nt8.nt_walkforward("SampleMACrossOver", {"Fast": [5]}, train_days=10, test_days=5,
+                                    min_trades=5, from_date="2026-01-01", to_date="2026-01-15")
+    row = result["table"][0]
+    assert row["state"] == "skipped" and row["inputs"] is None
+    assert "no in-sample combination qualified" in row["error"]
+
+
+def test_walkforward_passes_costs_through_to_every_inner_backtest():
+    seen = []
+    with FakeAddon() as fake:
+        _grid_fake(fake, lambda body: _doc("b1", 1.0), seen)
+        result = nt8.nt_walkforward("SampleMACrossOver", {"Fast": [5]}, train_days=10, test_days=5,
+                                    from_date="2026-01-01", to_date="2026-01-15", slippage_ticks=0.5)
+    assert all(body["slippageTicks"] == 0.5 for body in seen), "in-sample AND out-of-sample calls both get it"
+    assert result["costs"]["slippageTicks"] == 0.5
 
 
 def test_walkforward_anchored_pins_the_in_sample_start():

@@ -18,7 +18,7 @@ by default. Not affiliated with NinjaTrader, LLC.
                  |  MCP
                  v
 +----------------------------------------------------------+
-|  nt8-mcp  (Python MCP server: 50 tools + the nt8 CLI)    |
+|  nt8-mcp  (Python MCP server: 57 tools + the nt8 CLI)    |
 +----------------------------------------------------------+
                  |  HTTP on localhost:7891
                  v
@@ -83,7 +83,7 @@ about the edit-compile-look-fix loop.
    account. So no order can go to a live, funded or broker-demo account, and the two
    account-changing features are off by default, on disk, in every clone (see
    [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default) and the [Safety model](#safety-model)).
-6. **It is MCP-native.** 50 typed tools with docstrings written for a model, grouped by module. No
+6. **It is MCP-native.** 57 typed tools with docstrings written for a model, grouped by module. No
    bespoke IPC layer, no prompt glue.
 
 ## How it compares
@@ -252,7 +252,7 @@ AddOn passthroughs (need NT8 open with the AddOn compiled in), grouped by the mo
 | `nt_account(name="")` | Read-only account state (cash, P&L, positions, orders); no name = all accounts |
 | `nt_bridge_log(n=100)` | Tail of the AddOn's own request/error log |
 | `nt_screenshot(chart="first")` | PNG of the chart window |
-| `nt_status()` | Is the running assembly newer than the newest `.cs` on disk (`GET /ntstatus`) — self-referential: the code answering the question is the code being asked about, so a hung or stale AddOn cannot report itself stale |
+| `nt_status()` | Is the running assembly newer than the newest `.cs` on disk (`GET /ntstatus`), plus an out-of-band check from Python: the newest `.cs` date on disk against the build time, and the installed AddOn files against the repo's. It reports a `disagreement` when the AddOn says it is fresh and the disk says it is not, so a stale AddOn cannot vouch for itself |
 | `nt_compat()` | The reflection-resolution table for every NT8 member this repo binds by name (`GET /compat`) — what an NT8 upgrade broke |
 
 ### Compile / reload
@@ -287,7 +287,18 @@ AddOn passthroughs (need NT8 open with the AddOn compiled in), grouped by the mo
 `OnMarketData` need `tick_replay=True` (Tick Replay). `chart="first"` copies instrument and bar type from
 the first open chart; pass `instrument`/`bars_period` to override or skip that. It polls until the backtest
 finishes or `wait_s` elapses (use `nt_backtest_status`/`nt_backtests`/`nt_backtest_cancel` for a run still
-going). Example:
+going).
+
+**A run that did not happen cannot report `done`.** A strategy that never started, an instrument
+NinjaTrader cannot backtest, or a multi-series strategy asked for High fill resolution ends as
+`state:"error"` (or a `400`) with the reason, NinjaTrader's own dialog text included when there is
+one. `barsFrom` / `barsTo` are the window that really loaded. `output` holds the lines the run
+printed, or `null` plus `outputNote` when they could not be captured, never a false `[]`. `equity`
+is the cumulative net profit per closed trade, by exit time. Ratios that mean nothing on fewer
+than two trades are `null`. If a zero-trade result surprises you, run `SampleMACrossOver` on the
+same instrument and window first: it tells a data problem from a strategy problem in one call.
+
+Example:
 
 ```python
 nt_backtest("SampleMACrossOver", chart="first", from_date="2026-09-15", to_date="2026-09-17")
@@ -302,24 +313,47 @@ numbers.
 | Tool | Returns |
 |---|---|
 | `nt_optimize(strategy, ..., params, fitness="MaxNetProfit", top_n=10, min_trades=5, max_combos=200)` | Grid search over `/backtest`; refuses above `max_combos` naming the count instead of running |
-| `nt_walkforward(strategy, ..., optimization_period_days, test_period_days, anchored=False)` | In-sample optimize + one out-of-sample run per window |
+| `nt_walkforward(strategy, ..., optimization_period_days, test_period_days, anchored=False, include_trades=False)` | In-sample optimize + one out-of-sample run per window; always a compact per-window `table` |
+| `nt_analyze(run_id="", trades=None)` | Breakdowns of a saved run or a trade list: by month (exit time), weekday, hour, long vs short, MAE / MFE, streaks, drawdown with start / trough / recovery, time under water |
+| `nt_runs(limit=20, strategy="")`, `nt_run(id)`, `nt_run_compare(a, b)` | The run registry: every finished `nt_backtest` is saved with its request, costs, data window and a hash of the strategy source, so a result can be traced to the code that made it |
 | `nt_report(id="", status_doc=None, pdf_path="")` | Stats (equity curve, drawdown) and optionally a one-page PDF for a finished backtest |
+
+**Costs go all the way down.** `nt_optimize` and `nt_walkforward` take `slippage_ticks`,
+`commission_template`, `include_commission`, `fill_resolution*` and `fill_limit_on_touch`, pass them to
+every inner backtest, and echo them in `costs`. A run with none set says
+`gross: no slippage or commission modelled`. An inner run that failed is an error row; it is never
+ranked as a zero-profit result.
+
+### NinjaScript API lookup
+
+| Tool | Returns |
+|---|---|
+| `nt_api_search(query, limit=30)` | Types and members in the loaded NinjaTrader assemblies that match a keyword |
+| `nt_api(type_name, member="")` | The real signatures of one type: overloads, parameter names and types, properties, enum values |
+
+Read-only reflection on what NinjaTrader has loaded: nothing is created, nothing is called. Use it
+before you write NinjaScript against a member you are not sure of; it is cheaper than a failed
+compile.
 
 ### Data store
 
 | Tool | Returns |
 |---|---|
-| `nt_data_coverage(instrument, kind="", from_date="", to_date="")` | Which days the local tick/minute/day/replay stores hold for an instrument, before you run anything against it |
+| `nt_data_coverage(instrument, kind="", from_date="", to_date="")` | Which days the local tick/minute/day/replay stores hold for an instrument, plus what NinjaTrader's bars cache holds for its contract chain (the data a backtest can use with no provider connected) |
+| `nt_data_probe(instrument, kind="minute")` | How far back the connected data provider serves this instrument, found with a few small bounded requests; it reports only days it saw bars for |
 | `nt_nrd_export(instrument_glob, out_dir, levels=["L1","L2"], force=False)` | Offline decode of `.nrd` Market Replay files to Parquet — no NinjaTrader involvement |
-| `nt_data_download(instrument, from_date, to_date, kinds=["replay"], types=["Last","Bid","Ask"], overwrite=False)` | **Opt-in, flag-gated.** Downloads Market Replay / historical data into NT8's own store. See below |
+| `nt_data_download(instrument, from_date, to_date, kinds=["replay"], types=["Last","Bid","Ask"], overwrite=False)` | Fills missing historical data (tick / minute / day, or Market Replay) from the connected data provider into NT8's own store. See below |
 | `nt_data_download_status(id)` | Status of one download job |
 | `nt_data_download_cancel(id)` | Cancel a queued or running download |
 
 `nt_data_download` writes into the same store every open chart, SuperDOM and running strategy
-reads, and spends the data provider's bandwidth. It is refused unless the arming file
-`data.download.enabled` exists in `bin\Custom\AddOns` and is younger than 24 h, unless a real
-(non-Simulator/Playback) data connection is up, and while any account other than the Backtest
-account has an open position or a working order.
+reads, and spends the data provider's bandwidth. It needs no arming file: a download moves no
+money. It is refused unless a real (non-Simulator/Playback) data connection is up, and while any
+account other than the Backtest account has an open position or a working order. It works with
+a broker data feed, not only with NinjaTrader's own data service: the fetch uses the same bars
+request a backtest makes. A backtest also fetches bars it lacks from the connected provider on
+demand, so for a one-off test you may not need a download at all; `nt_data_probe` tells you how
+far back the provider goes.
 
 ### Feeds and connections
 
@@ -463,7 +497,7 @@ between dry-run and confirm) are covered by the automated test suite instead of 
 - **Local only.** The AddOn listens on `localhost:7891`. Nothing is sent to any server by this
   project; your code, charts and account data stay on your machine.
 - **Two opt-in features, each armed by an empty file you create by hand**, each ignored again
-  after 24 hours: `data.download.enabled` (historical data download) and `ops.enabled` (the ops
+  after 24 hours: `orders.enabled` (Simulator-only order entry) and `ops.enabled` (the ops
   module above). No tool, script or test in this repository creates either file for you.
 - **Live-connection guards.** An assembly reload and both ops actions are refused while a
   connection that can route orders to a real broker is up. A broker *demo* counts as live, on

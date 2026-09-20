@@ -49,7 +49,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 {
 	public partial class NT8Bridge : AddOnBase
 	{
-		public const string Version = "1.3.0";
+		public const string Version = "1.3.1";
 		private const int Port = 7891;
 		private static readonly TimeSpan UiTimeout = TimeSpan.FromSeconds(5);
 		private const int RebindTries = 5;													// bounded, off the UI thread

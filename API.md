@@ -76,7 +76,7 @@ accepts `first` (the first chart found).
 ### `GET /health`
 
 ```json
-{ "ok": true, "addonVersion": "1.3.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
+{ "ok": true, "addonVersion": "1.3.1", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
   "connections": [{"name":"Sim101 feed","status":"Connected","provider":"Simulator","canManageOrders":false}],
   "charts": 1, "anyLive": false, "anyNonSim": true, "standingModal": null,
   "pid": 12345, "processStartUtc": "2026-09-18T08:59:50Z",
@@ -540,7 +540,7 @@ Market Replay recordings can live only under the continuous name even when the f
 every tick file. `missingWeekdays`, `daysLackingBidAsk`, `thinDays` are hints from
 `analysisStore` (the first scanned, non-empty, non-year-granular store), never verdicts.
 
-### `POST /data/download` — opt-in, disarmed by default
+### `POST /data/download`
 
 **The one endpoint outside the ops module that writes NinjaTrader's own data store**
 (`db\replay`, `db\tick`, `db\minute`, `db\day`) and spends the data provider's bandwidth. It
@@ -549,25 +549,27 @@ touches no order, position or account.
 ```json
 {"instrument":"ES 12-26","from":"20260901","to":"20260910",
  "kinds":["replay"], "types":["Last","Bid","Ask"], "overwrite":false,"big":false}
-→ 202 {"id":"d1","state":"queued","days":10,"anyLive":false,"anyNonSim":true,
-       "flag":{"name":"data.download.enabled","armed":true,"ageHours":0.42,"maxAgeHours":24}}
+→ 202 {"id":"d1","state":"queued","days":10,"anyLive":false,"anyNonSim":true}
 ```
 
-**The arming flag**: a file `data.download.enabled` beside the AddOn in
-`bin\Custom\AddOns`, stat-checked on every request (never cached), **ignored once older than
-24 h**. Absent or stale → `403 {"error":"data download not enabled"}`. Published into
-`/compat` as `Data.downloadFlag`.
+**No arming file.** A download moves no money, so it is not an opt-in module. Historical
+tick / minute / day data is fetched with the bars request a backtest makes (merge policy
+`DoNotMerge`), so it works on a broker data feed as well as on NinjaTrader's own data service;
+each downloaded day names the route that served it. `GET /data/probe?instrument=&kind=` (job
+model, poll `GET /data/probe/{id}`) reports how far back the connected provider serves, counting
+only days it saw bars for. `GET /data/coverage` also carries a `cache` section: the series
+NinjaTrader's bars cache holds for the instrument's contract chain. Full contract:
+`docs/api/data.md`.
 
 **The guards.** A download routes no order, so the order-routing predicate does not gate it.
 Instead:
 
 | Guard | Role | Effect |
 |---|---|---|
-| flag `data.download.enabled` | arming | `403` without it |
 | `Data_Exposure()` | **the refusal** — an open position or working order on any account but Backtest | `409`, `"exposure":true`, names the account |
 | `AnyNonSimConnected()` | **the precondition** — a real data provider must be connected | `409` while false |
 
-All three are re-checked before every date of a running job. Other guards: range > 10 days
+Both are re-checked before every date of a running job. Other guards: range > 10 days
 needs `{"big":true}` (raises, does not remove, the cap — >400 days refused regardless);
 a range check on `from`/`to`; its own worker thread and job map so it never starves a
 backtest; Saturday is skipped; **the current and any future day (computed in

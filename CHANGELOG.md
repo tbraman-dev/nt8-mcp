@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.1 — 2026-09-19
+
+### Fixed
+
+- **A backtest that never ran can no longer report `done`.** A strategy that never started, no
+  bars loaded, or a multi-series strategy asked for High fill resolution ends as `state:"error"`
+  with the reason (NinjaTrader's own dialog text when there is one). A continuous-contract name
+  is refused with a `400` before the job is queued.
+- Backtest `output` now holds the lines the run printed (read from the output ring by cursor);
+  `null` plus `outputNote` when they could not be captured, never a false `[]`.
+- `sharpe` and `profitFactor` are `null` on fewer than two trades.
+- **`nt_optimize` and `nt_walkforward` model costs**: `slippage_ticks`, `commission_template`,
+  `include_commission`, `fill_resolution*`, `fill_limit_on_touch` go to every inner backtest and
+  are echoed in `costs`. A failed inner run is an error row, never a zero-profit result.
+- **`nt_data_download` works on a broker data feed.** The historical fetch now uses the bars
+  request a backtest makes (merge policy `DoNotMerge`); the earlier request returned no bars.
+  A failure names the route it used.
+
+### Added
+
+- `equity` on every backtest: cumulative net profit per closed trade, by exit time.
+- `nt_walkforward` / `nt_optimize`: `include_trades=False` by default and a compact per-window
+  `table`; the response schema is in `docs/api/optimize.md`.
+- `nt_analyze`: breakdowns by month (exit time), weekday, hour, side, MAE / MFE, streaks,
+  drawdown with start / trough / recovery, time under water.
+- Run registry: every finished `nt_backtest` is saved with its request, costs, data window and a
+  hash of the strategy source. `nt_runs`, `nt_run`, `nt_run_compare`.
+- `nt_api_search` / `nt_api`: real NinjaScript signatures by reflection on the loaded assemblies.
+- `nt_data_probe`: how far back the connected provider serves an instrument.
+- `nt_data_coverage` reports NinjaTrader's bars cache for the instrument's contract chain.
+- `nt_status` adds an out-of-band check from Python (disk dates and installed files against the
+  repo), so a stale AddOn cannot vouch for itself.
+
+### Changed
+
+- `/data/download` needs no arming file any more (a download moves no money). It is still
+  refused without a real data provider connected and while any account has a position or a
+  working order. 57 tools (50 + 7).
+
 ## 1.3.0 — 2026-09-19
 
 ### Added
