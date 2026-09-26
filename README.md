@@ -1,15 +1,49 @@
 # nt8-mcp
 
-**Give your AI assistant eyes and a build loop on NinjaTrader 8.**
+**Let Claude Code (or any MCP client) write, compile, chart-check and backtest your NinjaTrader 8
+NinjaScript — by itself.**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](server/pyproject.toml)
+[![Latest release](https://img.shields.io/github/v/release/tbraman-dev/nt8-mcp)](https://github.com/tbraman-dev/nt8-mcp/releases)
+[![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2.svg)](https://modelcontextprotocol.io)
 
 `nt8-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server plus a small
-NinjaTrader 8 AddOn. Together they let an AI coding assistant (Claude Code, or any MCP client) do
-what you do when you develop NinjaScript: write the code, compile it, put it on a chart, look at
-what it drew, read what it printed, backtest it, and fix what is wrong — without you pasting
-screenshots and compiler errors back and forth.
+NinjaTrader 8 AddOn. Together they let an AI coding assistant do what you do when you develop
+NinjaScript: write the code, compile it, put it on a chart, look at what it drew, read what it
+printed, backtest it, and fix what is wrong — without you pasting screenshots and compiler errors
+back and forth.
 
 It is built for **developing indicators and strategies**, not for placing trades. It is read-only
 by default. Not affiliated with NinjaTrader, LLC.
+
+## Quick start
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\install-addon.ps1   # then press F5 in the NinjaScript Editor once
+pip install -e server
+claude mcp add --scope user nt8 -- nt8-mcp
+nt8 health                                                         # NT8 running -> AddOn + NT8 version, connections
+```
+
+Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.10+. Details:
+[Requirements](#requirements) and [Install](#install).
+
+<!-- demo gif: docs/demo.gif -->
+
+## What can I ask it?
+
+- *"Add a 20-period volume-weighted band to my indicator, compile it, and check the plot values on
+  the ES chart match the math."*
+- *"The NinjaScript build is red. Find the errors and fix them."*
+- *"Backtest SampleMACrossOver on the first chart for last week with Tick Replay, 1 tick of
+  slippage, and show me the trades by hour."*
+- *"Run a walk-forward of my strategy's stop and target grid, 30 days in-sample, 10 days out."*
+- *"Which days of NQ tick and minute data do I have locally? Download the missing minute days for
+  last month."*
+- *"What is the real signature of `Draw.Line`? Check before you write the call."*
+
+## How it works
 
 ```text
 +----------------------------------------------------------+
@@ -91,11 +125,8 @@ about the edit-compile-look-fix loop.
    [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default) and the [Safety model](#safety-model)).
 6. **It is MCP-native.** 79 typed tools with docstrings written for a model, grouped by module. No
    bespoke IPC layer, no prompt glue.
-7. **It closes the loop with a simulation bench.** Write a strategy, compile it, backtest it
-   headlessly, then run it for real on a Simulator account or in a Market Replay session and
-   compare the fills against the backtest — build, compile, backtest, run on Sim or in a replay,
-   compare (see [Strategies on Sim](#strategies-on-sim-opt-in) and
-   [Playback control and the replay bench](#playback-control-and-the-replay-bench-opt-in)).
+7. **It closes the loop.** Build, compile, backtest, run on Sim or in a replay, and compare the
+   fills (the simulation bench above).
 
 ## How it compares
 
@@ -192,10 +223,12 @@ assistant can read in the same session before you connect it to funded money.
 
 ## Install
 
-1. Install the AddOn: `powershell -ExecutionPolicy Bypass -File scripts\install-addon.ps1`, then press F5 in the
+The [Quick start](#quick-start) commands, step by step:
+
+1. Install the AddOn with `scripts\install-addon.ps1`, then press F5 in the
    NinjaScript Editor (or let `nt_compile` do it once the MCP server is running). This copies every
    `addon/NT8Bridge*.cs` into `%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\`.
-2. Install the MCP server: `cd server && pip install -e .`
+2. Install the MCP server from the `server` folder (`pip install -e .`).
    Optional extras add two tools' dependencies — `pip install -e ".[parquet,report]"`: `parquet`
    (`numpy`, `pyarrow`) for `nt_nrd_export`, `report` (`matplotlib`) for `nt_report`'s PDF. Both
    tools work without them and degrade with a clear error naming the missing package.
@@ -206,12 +239,7 @@ assistant can read in the same session before you connect it to funded money.
    {"mcpServers":{"nt8":{"command":"nt8-mcp"}}}
    ```
 
-   or for every project:
-
-   ```
-   claude mcp add --scope user nt8 -- nt8-mcp
-   ```
-
+   or for every project, the `claude mcp add --scope user` line from the Quick start.
    Claude Code asks once to enable a project `.mcp.json` server; answer yes. The `nt_*` tools then load in the next session.
 
 Override the AddOn's address with the `NT8BRIDGE_URL` environment variable if it's not on the default port.
@@ -295,7 +323,9 @@ None of these touch an account or need an arming file. `nt_chart_indicator_add` 
 | `nt_reload_assembly(timeout_s=240)` | Compiles for real **and** swaps the running assembly (`POST /compile?reload=1`) so new/changed types are available immediately instead of waiting for NT8's own 20-150 s folder watcher. Disruptive; separate tool on purpose, never a flag on `nt_compile`. Refuses while a live order-routing connection is up; the tool cannot override that (no `force` argument is exposed) |
 | `nt_compile_f5(timeout_s=240)` | Cold-start fallback: press F5 in the NinjaScript Editor and wait for `NinjaTrader.Custom.dll` to be rebuilt. Kept as a fallback even after `nt_compile`/`nt_reload_assembly` landed |
 
-### Output / log (event rings — answer even with the Output window closed or the UI thread wedged)
+### Output / log
+
+Event rings: they answer even with the Output window closed or the UI thread wedged.
 
 | Tool | Returns |
 |---|---|
@@ -374,7 +404,7 @@ compile.
 | `nt_data_coverage(instrument, kind="", from_date="", to_date="")` | Which days the local tick/minute/day/replay stores hold for an instrument, plus what NinjaTrader's bars cache holds for its contract chain (the data a backtest can use with no provider connected) |
 | `nt_data_probe(instrument, kind="minute")` | How far back the connected data provider serves this instrument, found with a few small bounded requests; it reports only days it saw bars for |
 | `nt_nrd_export(instrument_glob, out_dir, levels=["L1","L2"], force=False)` | Offline decode of `.nrd` Market Replay files to Parquet — no NinjaTrader involvement |
-| `nt_data_download(instrument, from_date, to_date, kinds=["replay"], types=["Last","Bid","Ask"], overwrite=False)` | Fills missing historical data (tick / minute / day, or Market Replay) from the connected data provider into NT8's own store. See below |
+| `nt_data_download(instrument, from_date, to_date, kinds=["replay"], types=["Last","Bid","Ask"], overwrite=False, big=False)` | Fills missing historical data (tick / minute / day, or Market Replay) from the connected data provider into NT8's own store. Ranges wider than 10 days need `big=True`. See below |
 | `nt_data_download_status(id)` | Status of one download job |
 | `nt_data_download_cancel(id)` | Cancel a queued or running download |
 
@@ -386,6 +416,9 @@ a broker data feed, not only with NinjaTrader's own data service: the fetch uses
 request a backtest makes. A backtest also fetches bars it lacks from the connected provider on
 demand, so for a one-off test you may not need a download at all; `nt_data_probe` tells you how
 far back the provider goes.
+
+To use the downloaded tick and minute data in Python, export it offline to Parquet or CSV with
+[`ninjatrader-to-parquet`](https://github.com/tbraman-dev/ninjatrader-to-parquet).
 
 ### Feeds and connections
 
@@ -421,7 +454,9 @@ and a bounded run driver exist too, opt-in behind the order module's arming file
 Playback connection itself is still a manual step: none of these tools ever connect or disconnect
 it.
 
-Local tools (no AddOn needed, but do touch the filesystem / NT8's own windows):
+### Local tools (no AddOn needed)
+
+These touch the filesystem and NT8's own windows directly.
 
 | Tool | Returns |
 |---|---|
@@ -626,7 +661,7 @@ between dry-run and confirm) are covered by the automated test suite instead of 
 | Symptom | Cause and fix |
 |---|---|
 | `nt8 health` says connection refused | NinjaTrader is not running, or the AddOn is not compiled in. Run `scripts\install-addon.ps1`, then press F5 in a NinjaScript Editor once. |
-| You installed new code but the old behaviour is still there | NinjaTrader recompiles by itself 10-150 s after a `.cs` file lands. `nt_status` says if the running build is older than your source. Indicators already on a chart keep the old code until `nt_chart_reload`. |
+| You installed new code but the old behaviour is still there | NinjaTrader recompiles by itself 20-150 s after a `.cs` file lands. `nt_status` says if the running build is older than your source. Indicators already on a chart keep the old code until `nt_chart_reload`. |
 | A compile suddenly fails with hundreds of errors in files you did not touch | One duplicate or orphan file breaks the whole NinjaScript assembly. Look for `<name> (1).cs` copies made by a cloud-sync tool. `nt_compile` names the file and line of every error. |
 | A backtest ran different dates than you asked for | A connected **Playback** connection caps historical data at the replay clock. The result says so in `warnings`, with the real window in `barsFrom` / `barsTo`. Disconnect Playback for a backtest over other dates. |
 | A chart tool answers 504 | NinjaTrader's UI thread is blocked, most often by a message box. `nt_health` reports it as `standingModal`. `nt_output` and `nt_log` still answer. |
@@ -671,6 +706,13 @@ bash scripts/live-smoke.sh -b           # against a running NinjaTrader; -b adds
 NinjaTrader has no public API for most of what this project does, so the AddOn binds some internal
 members by name. `nt_compat` lists every one of them and whether it resolved on your version. After
 a NinjaTrader update, that table is the first place to look.
+
+## Related
+
+- [`ninjatrader-to-parquet`](https://github.com/tbraman-dev/ninjatrader-to-parquet) — reads
+  NinjaTrader 8 tick and minute history (`.ncd`) in Python and exports it to Parquet or CSV, with
+  NinjaTrader closed. Download history with `nt_data_download`, then export it offline for Python
+  backtests. (`nt_nrd_export` here covers the Market Replay `.nrd` files.)
 
 ## Credits
 
