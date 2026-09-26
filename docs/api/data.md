@@ -265,7 +265,9 @@ Both are re-checked before every date of a running job; exposure mid-run ends th
   `downloaded`. (Falls back to the machine's local date if the ET zone cannot be resolved.)
 - A date already on disk is `skipped` unless `overwrite:true`. For the `day` store that test
   is necessarily "is there a file for that YEAR", which is why `overwrite` is the honest
-  switch there.
+  switch there. For `tick` the test counts hourly files: Mon-Thu need 20, Friday 17, Sunday 1.
+  A tick fetch of day D also writes the first hours of D+1, so presence alone skipped D+1 thin.
+  A partial day is fetched again with overwrite on.
 - `downloaded` / `skipped` / `skippedCurrent` / `failed` stay **four separate buckets**: a
   planner must be able to tell "we did not ask" from "it failed".
 - A callback that reports success with nothing on disk is reported as a failure, not a

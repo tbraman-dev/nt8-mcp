@@ -790,6 +790,26 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return false;
 		}
 
+		/// <summary>Is this (kind, day, type) already complete on disk, so a non-overwrite job may skip it?
+		/// minute/day: same as Data_HasDay. tick: a fetch of day D also writes the first ~6 hourly files of D+1,
+		/// so presence alone made D+1 skip with 1-6 of 23 hours. Count the hourly files instead: Mon-Thu need 20
+		/// (full = 23), Friday 17 (closes 17:00 ET: 17-18 files by time zone), Sunday any (evening only).
+		/// ponytail: fixed thresholds, not the instrument's TradingHours — a holiday half-day re-fetches each run
+		/// (a few seconds); read the session template if that ever costs real time.</summary>
+		private static bool Data_DayComplete(string kind, string name, DateTime day, string type)
+		{
+			if (kind != "tick") return Data_HasDay(kind, name, day, type);
+			try
+			{
+				string dir = Path.Combine(Core.Globals.UserDataDir, "db", kind, name);
+				if (!Directory.Exists(dir)) return false;
+				int need = day.DayOfWeek == DayOfWeek.Sunday ? 1 : day.DayOfWeek == DayOfWeek.Friday ? 17 : 20;
+				return Directory.EnumerateFiles(dir, day.ToString("yyyyMMdd", CultureInfo.InvariantCulture) + "*." + type + ".ncd").Count() >= need;
+			}
+			catch { }
+			return false;
+		}
+
 		/// <summary>The connection candidates for a tick/minute/day download, in the order a chart would try
 		/// them: connected real (non-Simulator/Playback) providers first, then Simulator/Playback connections,
 		/// ClientConnection (NT8's own hosted data service) LAST — the decompile spike (addon/NOTES.md /
@@ -825,8 +845,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 		private static void Data_HistDay(Data_Job job, string kind, DateTime day, string ds)
 		{
-			var wanted = job.Types.Where(t => job.Overwrite || !Data_HasDay(kind, job.InstrumentName, day, t)).ToArray();
+			var wanted = job.Types.Where(t => job.Overwrite || !Data_DayComplete(kind, job.InstrumentName, day, t)).ToArray();
 			if (wanted.Length == 0) { Data_Add(job.Skipped, ds + "/" + kind); return; }
+			// A partial day on disk (see Data_DayComplete) is replaced, not merged: overwrite it.
+			bool overwrite = job.Overwrite || wanted.Any(t => Data_HasDay(kind, job.InstrumentName, day, t));
 
 			var th = job.Instrument.MasterInstrument.TradingHours;
 			Func<Collection<Data.Bars>> freshColl = () =>
@@ -863,7 +885,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 						// background job. This is exactly what the Historical Data window's Download button
 						// calls (HistoricalData.cs:442,539), just with the connection this module picked instead
 						// of a hardcoded ClientConnection.
-						Data.BarsSeries.DownloadFromProvider(freshColl(), job.Overwrite, false, null, candidates[i], false, false,
+						Data.BarsSeries.DownloadFromProvider(freshColl(), overwrite, false, null, candidates[i], false, false,
 							result => { ok = result; try { done.Set(); } catch { } });
 						if (!done.Wait(Data_DateTimeout))
 						{

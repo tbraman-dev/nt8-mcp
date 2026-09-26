@@ -585,7 +585,7 @@ needs `{"big":true}` (raises, does not remove, the cap — >400 days refused reg
 a range check on `from`/`to`; its own worker thread and job map so it never starves a
 backtest; Saturday is skipped; **the current and any future day (computed in
 `America/New_York`) are never downloaded** and land in `skippedCurrent`; a date already on disk
-is `skipped` unless `overwrite:true`; a callback reporting success with nothing on disk is
+(for `tick`: enough hourly files, see docs/api/data.md) is `skipped` unless `overwrite:true`; a callback reporting success with nothing on disk is
 reported as `failed`, never as a silent download.
 
 `downloaded`/`skipped`/`skippedCurrent`/`failed` are four separate buckets on the job document,
