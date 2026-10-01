@@ -142,9 +142,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// Eviction takes the oldest rows that are NO LONGER LIVE first.</summary>
 		private const int Ord_OwnedMax = 200;
 
-		/// <summary>Account.CreateOrder's `name` argument, on every leg this module sends. It is how an
-		/// order's owner reads back as "module" in /orders/status and in a change or cancel plan.</summary>
-		private const string Ord_OrderName = "NT8Bridge";
+		// Ord_OrderName (the name on every leg this module sends): NT8Bridge.Liveness.cs, the owner read recognises it.
 
 		/// <summary>A bound on the per-account order list in GET /orders/status.
 		/// ponytail: a flat cap with a truncated flag; paging if an account ever holds more than this.</summary>
@@ -1149,7 +1147,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			catch (Exception ex) { return Deep(ex); }
 		}
 
-		private static string Ord_SafeText(Func<string> f) { try { return f(); } catch { return null; } }
+		// Ord_SafeText: NT8Bridge.Liveness.cs (the core owner reads use it too)
 		private static int Ord_SafeInt(Func<int> f) { try { return f(); } catch { return 0; } }
 
 		// ── small readers ───────────────────────────────────────────────────────

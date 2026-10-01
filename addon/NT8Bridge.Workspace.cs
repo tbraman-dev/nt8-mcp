@@ -320,19 +320,19 @@ namespace NinjaTrader.NinjaScript.AddOns
 		}
 
 		/// <summary>Strategy Id -> the most alive state over every instance with that Id, and the Ids of the
-		/// runs this AddOn started (NT8BridgeDesk.cs / NT8BridgeStrategyRun.cs).</summary>
+		/// runs this AddOn started (NT8Bridge.Liveness.cs / NT8BridgeStrategyRun.cs).</summary>
 		private sealed class Ws_Ids { public Dictionary<long, string> States; public HashSet<long> Bridge = new HashSet<long>(); }
+
+		// Implemented in NT8BridgeStrategyRun.cs. Partial methods: a build without that module drops both calls,
+		// and every row then reads startedByBridge=false, which is true of a build that cannot start one.
+		static partial void Sr_Readopt();						// after a reload, take back the runs this AddOn started
+		static partial void Sr_BridgeIds(HashSet<long> ids);	// the strategy Ids of the runs this AddOn started
 
 		private static Ws_Ids Ws_IdInfo()
 		{
-			Sr_Readopt();			// after a reload, take back the runs this AddOn started so they read startedByBridge
+			Sr_Readopt();
 			var ids = new Ws_Ids { States = Desk_IdStates(Desk_All()) };
-			lock (Sr_Gate)
-				foreach (var run in Sr_RunList)
-				{
-					if (run.StoppedUtc != null) continue;
-					try { if (run.Strat != null) ids.Bridge.Add(run.Strat.Id); } catch { }
-				}
+			Sr_BridgeIds(ids.Bridge);
 			return ids;
 		}
 

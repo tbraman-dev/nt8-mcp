@@ -236,6 +236,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 			catch (Exception ex) { Log("/strategy save " + Sr_StoreName + ": " + Deep(ex)); }
 		}
 
+		/// <summary>The Ids of the runs this AddOn started and has not stopped (NT8Bridge.Workspace.cs rows).</summary>
+		static partial void Sr_BridgeIds(HashSet<long> ids)
+		{
+			lock (Sr_Gate)
+				foreach (var run in Sr_RunList)
+				{
+					if (run.StoppedUtc != null) continue;
+					try { if (run.Strat != null) ids.Add(run.Strat.Id); } catch { }
+				}
+		}
+
 		/// <summary>ONCE per assembly load, on the first /strategy call: take back the runs the previous load
 		/// started. A NinjaScript recompile reloads this AddOn with an empty registry while its strategies keep
 		/// running, so without this POST /strategy/stop could no longer reach them. A row comes back only when an
@@ -243,7 +254,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// Simulator or Playback account of the SAME name — the provider gate is applied again here, never
 		/// taken from the file. The rest are dropped from the file and logged. The whole pass runs under one
 		/// lock, so a second first-call waits for it and never numbers a new run before the old ids are back.</summary>
-		private static void Sr_Readopt()
+		static partial void Sr_Readopt()
 		{
 			lock (Sr_ReadoptGate)
 			{
@@ -333,10 +344,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// (.ref\nt8src\core\NinjaTrader.NinjaScript\NinjaScript.cs:17, 428) — not a WPF dependency
 		/// property — so this is a plain CLR read and needs no dispatcher hop. `enabled` is grid state and
 		/// proves nothing; this is the evidence (NOTES.md lesson 20).</summary>
-		private static string Sr_State(StrategyBase s)
-		{
-			try { return s.State.ToString(); } catch { return null; }
-		}
+		// Sr_State: NT8Bridge.Liveness.cs (the core owner reads use it too)
 
 		private static bool Sr_Ended(string state)
 		{
